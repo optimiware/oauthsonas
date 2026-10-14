@@ -15,6 +15,7 @@ import (
 type Config struct {
 	Issuer                  string        `yaml:"issuer"`
 	APIAudience             string        `yaml:"api_audience"`
+	AccessCode              string        `yaml:"access_code"`
 	TokenTTL                string        `yaml:"token_ttl"`
 	AuthorizationCodeTTL    string        `yaml:"authorization_code_ttl"`
 	RefreshTokenTTL         string        `yaml:"refresh_token_ttl"`
@@ -77,6 +78,18 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
+// ApplyEnv applies environment overrides that cannot live in the config file.
+// OAUTHSONAS_ACCESS_CODE replaces access_code when set (even with an empty
+// value) and is validated the same way, so a bad environment fails startup and
+// --check-config instead of starting with a weaker gate.
+func ApplyEnv(c *Config) error {
+	if raw, ok := os.LookupEnv("OAUTHSONAS_ACCESS_CODE"); ok {
+		c.AccessCode = raw
+		return c.Validate()
+	}
+	return nil
+}
+
 func (c *Config) Validate() error {
 	if err := validateAbsoluteURL(c.Issuer, "issuer"); err != nil {
 		return err
@@ -93,6 +106,15 @@ func (c *Config) Validate() error {
 	}
 	if err := validateAbsoluteURL(c.APIAudience, "api_audience"); err != nil {
 		return err
+	}
+	c.AccessCode = strings.TrimSpace(c.AccessCode)
+	if c.AccessCode != "" {
+		if strings.ContainsAny(c.AccessCode, " \t\r\n") {
+			return fmt.Errorf("access_code must not contain whitespace")
+		}
+		if len(c.AccessCode) < 16 {
+			return fmt.Errorf("access_code must be at least 16 characters")
+		}
 	}
 	var err error
 	if c.TokenTTLDuration, err = parseDuration(c.TokenTTL, "token_ttl", 15*time.Minute); err != nil {

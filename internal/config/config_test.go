@@ -160,3 +160,64 @@ func TestValidateRejectsReservedClaimNames(t *testing.T) {
 		})
 	}
 }
+
+func accessCodeConfig(code string) *Config {
+	return &Config{
+		Issuer:      "http://127.0.0.1:8181",
+		APIAudience: "https://api.example.test",
+		AccessCode:  code,
+		Clients:     []Client{{ID: "dashboard", Name: "Dashboard", Public: true, RedirectURIs: []string{"http://127.0.0.1:5173/callback"}}},
+		Personas:    []Persona{{ID: "user", Subject: "oauthsonas|user", Email: "user@example.test", Name: "User", Roles: []string{"viewer"}}},
+	}
+}
+
+func TestValidateAccessCode(t *testing.T) {
+	for name, tc := range map[string]struct {
+		code    string
+		wantErr string
+	}{
+		"empty disables the gate": {"", ""},
+		"valid":                   {"correct-horse-battery", ""},
+		"trimmed":                 {"  correct-horse-battery  ", ""},
+		"too short":               {"short", "at least 16"},
+		"whitespace":              {"correct horse battery", "whitespace"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := accessCodeConfig(tc.code).Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("access code %q rejected: %v", tc.code, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("access code %q: want error containing %q, got %v", tc.code, tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestApplyEnvAccessCode(t *testing.T) {
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "")
+	c := accessCodeConfig("file-configured-code")
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyEnv(c); err != nil {
+		t.Fatalf("empty env override must disable the gate: %v", err)
+	}
+	if c.AccessCode != "" {
+		t.Fatalf("env override not applied: %q", c.AccessCode)
+	}
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "environment-access-code")
+	if err := ApplyEnv(c); err != nil {
+		t.Fatalf("valid env override rejected: %v", err)
+	}
+	if c.AccessCode != "environment-access-code" {
+		t.Fatalf("env override not applied: %q", c.AccessCode)
+	}
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "short")
+	if err := ApplyEnv(c); err == nil || !strings.Contains(err.Error(), "at least 16") {
+		t.Fatalf("invalid env override accepted: %v", err)
+	}
+}

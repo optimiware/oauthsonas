@@ -38,12 +38,20 @@ type testInteraction struct {
 
 func newTestProvider(t *testing.T, codeTTL time.Duration) *testProvider {
 	t.Helper()
+	return newTestProviderConfig(t, codeTTL, nil)
+}
+
+func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*config.Config)) *testProvider {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := testConfig("http://" + listener.Addr().String())
 	c.AuthorizationCodeTTL = codeTTL.String()
+	if mutate != nil {
+		mutate(c)
+	}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -821,4 +829,241 @@ func TestPersonaPickerDataAttributes(t *testing.T) {
 			t.Errorf("picker missing class %s", want)
 		}
 	}
+}
+
+const gateCode = "correct-horse-battery-staple"
+
+func gatedProvider(t *testing.T) *testProvider {
+	t.Helper()
+	return newTestProviderConfig(t, 5*time.Minute, func(c *config.Config) { c.AccessCode = gateCode })
+}
+
+func findCookie(response *http.Response, name string) *http.Cookie {
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
+func gateIn(t *testing.T, p *testProvider, client *http.Client, returnTo string) {
+	t.Helper()
+	response, err := client.PostForm(p.baseURL+"/oauth2/gate", url.Values{"code": {gateCode}, "return_to": {returnTo}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("gate status = %d: %s", response.StatusCode, body)
+	}
+}
+
+func TestAccessCodeGateFlow(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	params := validAuthorizeParams()
+
+	response, err := client.Get(authorizeURL(p.baseURL, params))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("gate status = %d", response.StatusCode)
+	}
+	if !strings.Contains(string(body), `data-testid="access-code-input"`) {
+		t.Fatalf("gate page missing the code input: %s", body)
+	}
+	for _, cookie := range response.Cookies() {
+		if strings.HasPrefix(cookie.Name, interactionCookie) {
+			t.Errorf("the gate must not create an interaction cookie")
+		}
+	}
+
+	response, err = client.PostForm(p.baseURL+"/oauth2/gate", url.Values{"code": {"wrong-code-value"}, "return_to": {"/oauth2/auth?" + params.Encode()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong code status = %d, want 401", response.StatusCode)
+	}
+	if !strings.Contains(string(body), `data-testid="access-code-error"`) {
+		t.Errorf("wrong code must render the gate error: %s", body)
+	}
+	if findCookie(response, gateCookie) != nil {
+		t.Error("a rejected code must not set the gate cookie")
+	}
+
+	response, err = client.PostForm(p.baseURL+"/oauth2/gate", url.Values{"code": {gateCode}, "return_to": {"/oauth2/auth?" + params.Encode()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("valid code status = %d, want 303", response.StatusCode)
+	}
+	if got, want := response.Header.Get("Location"), "/oauth2/auth?"+params.Encode(); got != want {
+		t.Errorf("redirect = %q, want %q", got, want)
+	}
+	cookie := findCookie(response, gateCookie)
+	if cookie == nil || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" {
+		t.Fatalf("gate cookie attributes = %#v", cookie)
+	}
+
+	// The jar now holds the gate cookie: the picker renders, selection issues a
+	// code, and the exchange still completes.
+	interaction := begin(t, p, client, params)
+	code := selectPersona(t, p, client, interaction, "acme-admin")
+	if code == "" {
+		t.Fatal("gated flow did not issue an authorization code")
+	}
+}
+
+func TestAccessCodeGateBlocksLoginHint(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	params := validAuthorizeParams()
+	params.Set("login_hint", "acme-admin")
+
+	response, err := client.Get(authorizeURL(p.baseURL, params))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `data-testid="access-code-input"`) {
+		t.Fatalf("login_hint must not bypass the gate: status=%d body=%s", response.StatusCode, body)
+	}
+
+	gateIn(t, p, client, "/oauth2/auth?"+params.Encode())
+	response, err = client.Get(authorizeURL(p.baseURL, params))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusFound && response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("gated login_hint status = %d", response.StatusCode)
+	}
+	if !strings.Contains(response.Header.Get("Location"), "code=") {
+		t.Fatalf("gated login_hint location = %q", response.Header.Get("Location"))
+	}
+}
+
+func TestAccessCodeGateSelectRequiresCookie(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	gateIn(t, p, client, "/oauth2/auth")
+	interaction := begin(t, p, client, validAuthorizeParams())
+
+	bare := browserClient(t)
+	response, err := bare.PostForm(p.baseURL+"/oauth2/auth/select", url.Values{"csrf": {interaction.csrf}, "interaction_id": {interaction.id}, "persona": {"acme-admin"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("select without the gate cookie = %d, want 403", response.StatusCode)
+	}
+}
+
+func TestAccessCodeGateRejectsBadReturnTo(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	for _, raw := range []string{"", "https://evil.test/oauth2/auth", "//evil.test/oauth2/auth", "/logout", "/oauth2/authx", "/oauth2/auth#fragment"} {
+		response, err := client.PostForm(p.baseURL+"/oauth2/gate", url.Values{"code": {gateCode}, "return_to": {raw}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("return_to %q = %d, want 400", raw, response.StatusCode)
+		}
+		if findCookie(response, gateCookie) != nil {
+			t.Errorf("return_to %q must not set the gate cookie", raw)
+		}
+	}
+}
+
+func TestAccessCodeGateRejectsDuplicateFields(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	for name, values := range map[string]url.Values{
+		"code":      {"code": {gateCode, gateCode}, "return_to": {"/oauth2/auth"}},
+		"return_to": {"code": {gateCode}, "return_to": {"/oauth2/auth", "/oauth2/auth"}},
+	} {
+		response, err := client.PostForm(p.baseURL+"/oauth2/gate", values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("duplicate %s = %d, want 400", name, response.StatusCode)
+		}
+	}
+}
+
+func TestAccessCodeGatePageSecurityHeaders(t *testing.T) {
+	p := gatedProvider(t)
+	client := browserClient(t)
+	response, err := client.Get(authorizeURL(p.baseURL, validAuthorizeParams()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	for header, want := range map[string]string{
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+		"Referrer-Policy":         "no-referrer",
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+	} {
+		if got := response.Header.Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestAccessCodeGateLeavesProtocolEndpointsOpen(t *testing.T) {
+	p := gatedProvider(t)
+	for _, path := range []string{"/.well-known/openid-configuration", "/.well-known/jwks.json", "/healthz", "/readyz"} {
+		response, err := http.Get(p.baseURL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("%s = %d, want 200 without the gate cookie", path, response.StatusCode)
+		}
+	}
+}
+
+func TestAccessCodeGateDisabled(t *testing.T) {
+	p := newTestProvider(t, 5*time.Minute)
+	client := browserClient(t)
+
+	response, err := client.Get(p.baseURL + "/oauth2/gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /oauth2/gate with the gate disabled = %d, want 405", response.StatusCode)
+	}
+
+	response, err = client.PostForm(p.baseURL+"/oauth2/gate", url.Values{"code": {gateCode}, "return_to": {"/oauth2/auth"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /oauth2/gate with the gate disabled = %d, want 404", response.StatusCode)
+	}
+
+	// The picker still renders without any cookie.
+	_ = begin(t, p, client, validAuthorizeParams())
 }

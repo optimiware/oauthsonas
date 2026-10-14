@@ -52,6 +52,10 @@ func main() {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	if err := config.ApplyEnv(c); err != nil {
+		logger.Error("failed to apply environment overrides", "error", err)
+		os.Exit(1)
+	}
 	if *checkConfig {
 		logger.Info("configuration is valid", "path", *configPath)
 		return
