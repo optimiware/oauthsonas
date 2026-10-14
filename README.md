@@ -12,7 +12,7 @@
 
 ## Security warning
 
-**Development and test use only. Never expose this server to the internet or deploy it to production.** It has an in-memory persona picker instead of real authentication, generates a new signing key on every start, and has no persistent state. It binds to `127.0.0.1` by default and refuses non-loopback addresses unless `OAUTHSONAS_ALLOW_NON_LOOPBACK=true` is set deliberately.
+**Development and test use only. Never expose this server to the internet or deploy it to production.** It has an in-memory persona picker instead of real authentication, generates a new signing key on every start, and has no persistent state. It binds to `127.0.0.1` by default and refuses non-loopback addresses unless `OAUTHSONAS_ALLOW_NON_LOOPBACK=true` is set deliberately. An optional shared `access_code` limits who can use a deliberately exposed instance; it is a perimeter around the picker, not authentication.
 
 ## Quick usage
 
@@ -110,6 +110,12 @@ To add a persona, append a unique entry under `personas`:
 ```
 
 Roles are carried as names only. This server never expands roles into application permissions. Add an optional top-level `allowed_roles` list if a project wants configuration-time role vocabulary validation; otherwise any non-empty role name is valid.
+
+An optional top-level `access_code` requires a shared code before the persona picker (and before `login_hint` completes an authorization). The code must be at least 16 characters with no whitespace, and the environment variable `OAUTHSONAS_ACCESS_CODE` overrides the file value when set. An empty or omitted value leaves the picker open, which is the local default.
+
+```yaml
+access_code: "only-for-exposed-test-instances"
+```
 
 Client `redirect_uris` and `post_logout_redirect_uris` are exact-match registration values; they may include fixed query parameters but never fragments. `allowed_origins` permits browser CORS only for the listed origins. Token and userinfo responses apply client-specific CORS; discovery and JWKS apply CORS only to the union of registered origins, never `*`.
 
@@ -241,7 +247,7 @@ OAuthSonas is designed for single-replica deployments only. Constraints:
 - **One replica max.** All protocol state (tokens, authorization codes, interactions, signing keys) is process-local and in-memory. Running multiple replicas behind a load balancer will cause interaction cookie mismatches, invalid token signatures, and undefined behavior.
 - **No rolling surge.** Deployments must use `strategy: Recreate`. A second pod started alongside the old one would generate a different signing key and break JWKS validation.
 - **No shared load balancing** across instances.
-- **Restart invalidates everything.** All issued tokens, authorization codes, and interactions are lost on restart.
+- **Restart invalidates everything.** All issued tokens, authorization codes, interactions, and access-code sessions are lost on restart; a gated instance asks for the code again.
 - **Use `/healthz` for liveness** and **`/readyz` for readiness** probes.
 
 The server performs periodic garbage collection of expired in-memory state. For long-running instances, consider a process lifecycle manager that periodically restarts the pod.
@@ -254,6 +260,9 @@ The persona picker exposes stable selectors for test frameworks. The form contra
 
 | Element | Selector |
 |---|---|
+| Access-code input (when configured) | `input[data-testid="access-code-input"]` |
+| Access-code submit | `button[data-testid="access-code-submit"]` |
+| Access-code error | `[data-testid="access-code-error"]` |
 | Persona form container | `form[data-testid="persona-form-<id>"]` or `.persona-form` |
 | CSRF hidden input | `input[data-testid="csrf-input"]` |
 | Interaction ID hidden input | `input[data-testid="interaction-id-input"]` |
@@ -261,8 +270,9 @@ The persona picker exposes stable selectors for test frameworks. The form contra
 
 ### Flow
 
-Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the same request 302s to `redirect_uri` with `code` and `state`. Use this from agents and `oidc-client-ts` (`extraQueryParams: { login_hint }`). Unknown or missing hints still render the picker.
+Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the same request 302s to `redirect_uri` with `code` and `state`. Use this from agents and `oidc-client-ts` (`extraQueryParams: { login_hint }`). Unknown or missing hints still render the picker. A configured access code is always required first.
 
+0. If the server has an `access_code`, `GET /oauth2/auth` returns the access-code form (HTTP 200) instead of completing anything, with the original request URI in a hidden `return_to` field. Submit `POST /oauth2/gate` with form fields `code` and `return_to`; on success the response is a 303 back to `return_to` and sets the `oauthsonas_gate` cookie. A wrong code returns HTTP 401 and the form again.
 1. Navigate to `GET /oauth2/auth?...` with standard OIDC params.
 2. The response page contains one `<form>` per persona with the selectors above.
 3. Extract `csrf` and `interaction_id` from the hidden inputs.
@@ -285,6 +295,7 @@ Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the s
 - `GET /.well-known/jwks.json`
 - `GET /oauth2/auth`
 - `POST /oauth2/auth/select`
+- `POST /oauth2/gate`
 - `POST /oauth2/token`
 - `GET|POST /userinfo`
 - `GET /logout`

@@ -4,6 +4,12 @@ token_ttl: 15m
 authorization_code_ttl: 5m
 refresh_token_ttl: 8h
 
+# Optional: require a shared access code before the persona picker. An empty
+# or omitted value leaves the picker open. The code must be at least 16
+# characters and contain no whitespace. The environment variable
+# OAUTHSONAS_ACCESS_CODE overrides this value when set.
+# access_code: ""
+
 # Claim names default to bare keys (roles, memberships, org_id).
 # Override them when your relying party expects different keys
 # (for example Auth0-style namespaced custom claims).

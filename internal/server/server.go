@@ -28,6 +28,12 @@ import (
 )
 
 const interactionCookie = "oauthsonas_interaction"
+const gateCookie = "oauthsonas_gate"
+
+const (
+	gateSessionTTL   = 12 * time.Hour
+	gateFailureDelay = 250 * time.Millisecond
+)
 
 type Server struct {
 	config       *config.Config
@@ -37,6 +43,8 @@ type Server struct {
 	clients      map[string]config.Client
 	personas     map[string]config.Persona
 	interactions interactionStore
+	gate         gateStore
+	accessCode   string
 	tokenMu      sync.Mutex
 	template     *template.Template
 	logger       *slog.Logger
@@ -141,6 +149,40 @@ func (s *interactionStore) take(id, csrf string) (fosite.AuthorizeRequester, boo
 	return value.request, true
 }
 
+// gateStore holds the access-code sessions behind oauthsonas_gate cookies.
+// Sessions are process-local, matching every other piece of protocol state.
+type gateStore struct {
+	mu sync.Mutex
+	m  map[string]time.Time
+}
+
+func (s *gateStore) put() (string, error) {
+	id, err := randomString(32)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = map[string]time.Time{}
+	}
+	now := time.Now()
+	for key, expires := range s.m {
+		if now.After(expires) {
+			delete(s.m, key)
+		}
+	}
+	s.m[id] = now.Add(gateSessionTTL)
+	return id, nil
+}
+
+func (s *gateStore) valid(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expires, ok := s.m[id]
+	return ok && time.Now().Before(expires)
+}
+
 func New(c *config.Config, logger *slog.Logger, version string) (*Server, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -202,7 +244,7 @@ func New(c *config.Config, logger *slog.Logger, version string) (*Server, error)
 	for _, p := range c.Personas {
 		personas[p.ID] = p
 	}
-	s := &Server{config: c, provider: provider, store: store, key: key, clients: clients, personas: personas, template: personaTemplate, logger: logger, version: version, startTime: time.Now(), cleanupDone: make(chan struct{})}
+	s := &Server{config: c, provider: provider, store: store, key: key, clients: clients, personas: personas, template: personaTemplate, accessCode: c.AccessCode, logger: logger, version: version, startTime: time.Now(), cleanupDone: make(chan struct{})}
 	s.startCleanup()
 	return s, nil
 }
@@ -215,6 +257,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/.well-known/jwks.json", s.jwks)
 	mux.HandleFunc("/oauth2/auth", s.authorize)
 	mux.HandleFunc("/oauth2/auth/select", s.selectPersona)
+	mux.HandleFunc("/oauth2/gate", s.gateSubmit)
 	mux.HandleFunc("/oauth2/token", s.token)
 	mux.HandleFunc("/userinfo", s.userinfo)
 	mux.HandleFunc("/logout", s.logout)
@@ -318,6 +361,10 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 
 // authorize handles GET /oauth2/auth, the OIDC authorization endpoint.
 //
+// When an access_code is configured, a request without a valid oauthsonas_gate
+// cookie receives the access-code form instead of completing (or rendering)
+// anything; login_hint does not skip the gate.
+//
 // Optional login_hint=<persona id> (exactly one, ids only) completes the
 // authorize request in the same GET: the handler consumes the interaction it
 // just created and 302/303s to redirect_uri with code and state. No picker,
@@ -326,6 +373,10 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if s.accessCode != "" && !s.gateAuthorized(r) {
+		s.renderGate(w, r.URL.RequestURI(), http.StatusOK, "")
 		return
 	}
 	ar, err := s.provider.NewAuthorizeRequest(r.Context(), r)
@@ -421,6 +472,92 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// gateAuthorized reports whether the request carries an unexpired access-code
+// session.
+func (s *Server) gateAuthorized(r *http.Request) bool {
+	cookie, err := r.Cookie(gateCookie)
+	return err == nil && s.gate.valid(cookie.Value)
+}
+
+// renderGate renders the access-code form. returnTo is the original
+// /oauth2/auth request URI the successful submission bounces back to.
+func (s *Server) renderGate(w http.ResponseWriter, returnTo string, status int, errorMessage string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_ = gateTemplate.Execute(w, struct {
+		ReturnTo string
+		Error    string
+	}{returnTo, errorMessage})
+}
+
+// validGateReturnTo accepts only the local authorize request URI: a relative
+// reference to /oauth2/auth with an optional query, never a scheme, host, or
+// fragment.
+func validGateReturnTo(raw string) bool {
+	if raw == "" || strings.HasPrefix(raw, "//") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.IsAbs() || u.Host != "" || u.Fragment != "" {
+		return false
+	}
+	return u.Path == "/oauth2/auth"
+}
+
+// gateSubmit handles POST /oauth2/gate, the access-code form. On success it
+// sets the gate cookie and redirects to the original authorize request; a
+// wrong code re-renders the form with HTTP 401 after a fixed delay.
+func (s *Server) gateSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.accessCode == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	for _, name := range []string{"code", "return_to"} {
+		if len(r.PostForm[name]) > 1 {
+			http.Error(w, name+" must not be repeated", http.StatusBadRequest)
+			return
+		}
+	}
+	returnTo := r.Form.Get("return_to")
+	if !validGateReturnTo(returnTo) {
+		http.Error(w, "invalid return_to", http.StatusBadRequest)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Form.Get("code")), []byte(s.accessCode)) != 1 {
+		time.Sleep(gateFailureDelay)
+		s.renderGate(w, returnTo, http.StatusUnauthorized, "Invalid access code.")
+		return
+	}
+	id, err := s.gate.put()
+	if err != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     gateCookie,
+		Value:    id,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(gateSessionTTL.Seconds()),
+		Secure:   strings.HasPrefix(s.config.Issuer, "https://"),
+	})
+	http.Redirect(w, r, returnTo, http.StatusSeeOther)
+}
+
 func (s *Server) validateBrowserRequest(r *http.Request) error {
 	q := r.URL.Query()
 	for _, name := range []string{"response_type", "client_id", "redirect_uri", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "audience", "response_mode", "login_hint"} {
@@ -502,6 +639,10 @@ func (s *Server) validateBrowserRequest(r *http.Request) error {
 func (s *Server) selectPersona(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.accessCode != "" && !s.gateAuthorized(r) {
+		http.Error(w, "access code required", http.StatusForbidden)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -1068,3 +1209,6 @@ func personasSlice(m map[string]config.Persona) []config.Persona {
 
 var personaTemplate = template.Must(template.New("persona").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Select a test persona</title><style>body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem}ul{padding:0;list-style:none}li{border:1px solid #ccd;border-radius:.5rem;margin:.75rem 0;padding:1rem}button{font:inherit;padding:.45rem .8rem;cursor:pointer}.meta{color:#445;margin:.25rem 0}.roles{font-family:ui-monospace,monospace}</style></head><body><main><h1>Select a test persona</h1><p>This local development server will complete a real OpenID Connect authorization flow.</p><ul>{{range .Personas}}<li><strong class="persona-name">{{.Name}}</strong><div class="meta persona-email">{{.Email}}</div><div class="meta roles">roles: {{range $i, $r := .Roles}}{{if $i}}, {{end}}{{$r}}{{end}}</div>{{if .OrganizationID}}<div class="meta">organization: {{.OrganizationID}}</div>{{end}}{{if .Memberships}}<div class="meta">memberships: {{range $i, $m := .Memberships}}{{if $i}}, {{end}}{{$m}}{{end}}</div>{{end}}<form method="post" action="/oauth2/auth/select" data-testid="persona-form-{{.ID}}" class="persona-form"><input type="hidden" name="csrf" value="{{$.CSRF}}" data-testid="csrf-input"><input type="hidden" name="interaction_id" value="{{$.InteractionID}}" data-testid="interaction-id-input"><button name="persona" value="{{.ID}}" type="submit" data-testid="persona-select-{{.ID}}">Continue as {{.Name}}</button></form></li>{{end}}</ul></main></body></html>`))
+
+var gateTemplate = template.Must(template.New("gate").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Enter the access code</title><style>body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem}form{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}input{font:inherit;padding:.45rem .6rem;width:22rem;max-width:100%}button{font:inherit;padding:.45rem .8rem;cursor:pointer}.error{color:#a00}</style></head><body><main><h1>Enter the access code</h1><p>This development server requires a shared access code before the persona picker.</p><form method="post" action="/oauth2/gate"><input type="hidden" name="return_to" value="{{.ReturnTo}}"><input type="password" name="code" autocomplete="off" required autofocus data-testid="access-code-input"><button type="submit" data-testid="access-code-submit">Continue</button></form>{{if .Error}}<p class="error" data-testid="access-code-error">{{.Error}}</p>{{end}}</main></body></html>`))
