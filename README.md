@@ -89,7 +89,7 @@ OIDC_CLIENT_ID=dashboard
 OIDC_REDIRECT_URI=http://127.0.0.1:5173/auth/callback
 OIDC_POST_LOGOUT_REDIRECT_URI=http://127.0.0.1:5173/
 OIDC_SCOPE="openid profile email"
-OIDC_AUDIENCE=https://api.optimicdn.test
+OIDC_AUDIENCE=https://api.example.test
 ```
 
 The example client is public and requires S256 PKCE. The authorization page lets a developer select a configured persona; it then redirects to the dashboard callback with a normal authorization code and unchanged `state`.

@@ -624,11 +624,11 @@ func (s *Server) validateBrowserRequest(r *http.Request) error {
 //
 // # Requirements
 //
-//	- The request must include the cookie oauthsonas_interaction_<id> set in step 1.
-//	- The CSRF token is one-shot. Replay or tampering returns HTTP 403.
-//	- Duplicate form parameters are rejected with HTTP 400.
-//	- On success, the handler redirects (302/303) to the registered redirect_uri
-//	  with code= and state= query parameters.
+//   - The request must include the cookie oauthsonas_interaction_<id> set in step 1.
+//   - The CSRF token is one-shot. Replay or tampering returns HTTP 403.
+//   - Duplicate form parameters are rejected with HTTP 400.
+//   - On success, the handler redirects (302/303) to the registered redirect_uri
+//     with code= and state= query parameters.
 //
 // # Selectors for Test Frameworks
 //
@@ -829,17 +829,17 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "token",
 			slog.String("status", "error"),
 			slog.String("error_category", "internal"),
-		slog.String("grant_type", strings.Join(accessRequest.GetGrantTypes(), " ")),
+			slog.String("grant_type", strings.Join(accessRequest.GetGrantTypes(), " ")),
+			slog.String("client_id", accessRequest.GetClient().GetID()),
+			slog.String("error", err.Error()),
+		)
+		s.provider.WriteAccessError(r.Context(), w, accessRequest, err)
+		return
+	}
+	s.logger.LogAttrs(r.Context(), slog.LevelInfo, "token",
+		slog.String("status", "issued"),
 		slog.String("client_id", accessRequest.GetClient().GetID()),
-		slog.String("error", err.Error()),
-	)
-	s.provider.WriteAccessError(r.Context(), w, accessRequest, err)
-	return
-}
-s.logger.LogAttrs(r.Context(), slog.LevelInfo, "token",
-	slog.String("status", "issued"),
-	slog.String("client_id", accessRequest.GetClient().GetID()),
-	slog.String("grant_type", strings.Join(accessRequest.GetGrantTypes(), " ")),
+		slog.String("grant_type", strings.Join(accessRequest.GetGrantTypes(), " ")),
 	)
 	s.provider.WriteAccessResponse(r.Context(), w, accessRequest, response)
 }

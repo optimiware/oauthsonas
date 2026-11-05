@@ -67,7 +67,7 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 
 func testConfig(issuer string) *config.Config {
 	return &config.Config{
-		Issuer: issuer, APIAudience: "https://api.optimicdn.test", TokenTTL: "15m", AuthorizationCodeTTL: "5m", RefreshTokenTTL: "8h",
+		Issuer: issuer, APIAudience: "https://api.example.test", TokenTTL: "15m", AuthorizationCodeTTL: "5m", RefreshTokenTTL: "8h",
 		Clients: []config.Client{{ID: "dashboard", Name: "Dashboard", Public: true, RedirectURIs: []string{"http://127.0.0.1:5173/auth/callback"}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:5173/"}, AllowedOrigins: []string{"http://127.0.0.1:5173"}}},
 		Personas: []config.Persona{
 			{ID: "acme-admin", Subject: "oauthsonas|acme-admin", Email: "admin@acme.dev.optimi.test", Name: "Acme Administrator", OrganizationID: "org_acme", Roles: []string{"customer-admin"}},
@@ -95,7 +95,7 @@ func authorizeURL(base string, params url.Values) string {
 }
 
 func validAuthorizeParams() url.Values {
-	return url.Values{"response_type": {"code"}, "client_id": {"dashboard"}, "redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "scope": {"openid profile email"}, "state": {"state-value-123"}, "nonce": {"nonce-value-123"}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"}, "audience": {"https://api.optimicdn.test"}}
+	return url.Values{"response_type": {"code"}, "client_id": {"dashboard"}, "redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "scope": {"openid profile email"}, "state": {"state-value-123"}, "nonce": {"nonce-value-123"}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"}, "audience": {"https://api.example.test"}}
 }
 
 func begin(t *testing.T, p *testProvider, client *http.Client, params url.Values) testInteraction {
@@ -235,7 +235,7 @@ func TestDiscoveryAndFullAuthorizationCodeFlow(t *testing.T) {
 	if _, ok := access["email"]; ok {
 		t.Fatalf("access token must not contain profile claims: %#v", access)
 	}
-	if !containsString(access["aud"], "https://api.optimicdn.test") || !containsString(access["roles"], "customer-admin") || access["org_id"] != "org_acme" {
+	if !containsString(access["aud"], "https://api.example.test") || !containsString(access["roles"], "customer-admin") || access["org_id"] != "org_acme" {
 		t.Fatalf("bad access claims: %#v", access)
 	}
 	if id["iss"] != p.baseURL || id["sub"] != "oauthsonas|acme-admin" || id["nonce"] != "nonce-value-123" || !containsString(id["aud"], "dashboard") {
@@ -299,7 +299,7 @@ func TestOAuth2ClientAuthorizationCodeFlow(t *testing.T) {
 		"state-value-123",
 		oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("nonce", "nonce-value-123"),
-		oauth2.SetAuthURLParam("audience", "https://api.optimicdn.test"),
+		oauth2.SetAuthURLParam("audience", "https://api.example.test"),
 	)
 	u, err := url.Parse(authorizeURL)
 	if err != nil {
