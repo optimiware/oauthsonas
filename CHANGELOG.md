@@ -26,6 +26,9 @@
   the old message needs updating.
 - Go 1.26.10 / 1.27.3 pick up standard-library security fixes (`net/http`,
   HTTP/2, `crypto/tls`, `crypto/x509`). The previous image was built with 1.27.0.
+- `golang.org/x/crypto` is pinned to a commit after v0.58.0 that fixes advisory
+  GO-2026-5932 (the `openpgp` package, which oauthsonas never imported); no
+  tagged release contains the fix yet. Move back to a tag once one exists.
 
 ### Fixed
 
