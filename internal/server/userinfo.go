@@ -10,6 +10,9 @@ import (
 
 // userinfo handles GET and POST /userinfo for bearer access tokens.
 func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
+	// Errors must be readable by a browser app, so any registered origin gets
+	// CORS headers up front; the token's own client narrows this below.
+	s.unionCORS(w, r, http.MethodGet, http.MethodPost)
 	token, err := bearerToken(w, r)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)

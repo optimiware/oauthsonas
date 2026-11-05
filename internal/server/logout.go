@@ -11,10 +11,14 @@ import (
 	"github.com/go-jose/go-jose/v3"
 )
 
-// logout handles GET /logout (RP-initiated logout). It holds no session, so
+// logout handles GET and POST /logout (RP-initiated logout). It holds no session, so
 // it only validates and performs the post-logout redirect.
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+	if err := parseForm(w, r); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	q := r.Form
 	target, clientID, idTokenHint := q.Get("post_logout_redirect_uri"), q.Get("client_id"), q.Get("id_token_hint")
 	if idTokenHint != "" {
 		hintClientID, err := s.clientIDFromIDTokenHint(idTokenHint)

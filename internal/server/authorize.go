@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/optimiweb/oauthsonas/internal/config"
@@ -94,7 +95,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 // enforces on browser authorize requests.
 func (s *Server) checkAuthorizeRequest(r *http.Request, ar fosite.AuthorizeRequester) error {
 	q := r.URL.Query()
-	if name, repeated := rejectRepeated(q, "response_type", "client_id", "redirect_uri", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "audience", "response_mode", "login_hint"); repeated {
+	if name, repeated := rejectRepeated(q, "response_type", "client_id", "redirect_uri", "scope", "state", "nonce", "code_challenge", "code_challenge_method", "audience", "response_mode", "login_hint", "prompt"); repeated {
 		return fosite.ErrInvalidRequest.WithHintf("%s must not be repeated", name)
 	}
 	if q.Get("redirect_uri") == "" {
@@ -122,6 +123,25 @@ func (s *Server) checkAuthorizeRequest(r *http.Request, ar fosite.AuthorizeReque
 	}
 	if !ar.GetRequestedScopes().Has("openid") {
 		return fosite.ErrInvalidScope.WithHint("openid scope is required")
+	}
+	return checkPrompt(q.Get("prompt"))
+}
+
+// checkPrompt validates the OIDC prompt parameter up front. fosite only
+// inspects it after a persona has been chosen, which would leave silent-renew
+// requests (prompt=none) hanging on the picker.
+func checkPrompt(raw string) error {
+	prompts := strings.Fields(raw)
+	for _, prompt := range prompts {
+		if !slices.Contains([]string{"none", "login", "consent", "select_account"}, prompt) {
+			return fosite.ErrInvalidRequest.WithHintf("unknown prompt value %q", prompt)
+		}
+	}
+	if slices.Contains(prompts, "none") {
+		if len(prompts) > 1 {
+			return fosite.ErrInvalidRequest.WithHint("prompt=none must not be combined with other values")
+		}
+		return fosite.ErrLoginRequired.WithHint("this server keeps no login session, so prompt=none can never succeed")
 	}
 	return nil
 }

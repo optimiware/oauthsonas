@@ -123,6 +123,14 @@ func setCORS(w http.ResponseWriter, origin string, methods []string) {
 	h.Set("Access-Control-Allow-Origin", origin)
 	h.Set("Access-Control-Allow-Methods", strings.Join(methods, ", "))
 	h.Set("Access-Control-Allow-Headers", corsAllowedHdr)
+	h.Set("Access-Control-Expose-Headers", "WWW-Authenticate")
+}
+
+func clearCORS(w http.ResponseWriter) {
+	h := w.Header()
+	for _, name := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Expose-Headers"} {
+		h.Del(name)
+	}
 }
 
 // originAllowedByAnyClient reports whether any registered client lists origin.
@@ -172,6 +180,7 @@ func clientCORS(w http.ResponseWriter, r *http.Request, client config.Client, me
 	}
 	w.Header().Set("Vary", "Origin")
 	if !slices.Contains(client.AllowedOrigins, origin) {
+		clearCORS(w)
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return false
 	}

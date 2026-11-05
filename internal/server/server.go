@@ -179,5 +179,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /userinfo", s.userinfo)
 	mux.HandleFunc("OPTIONS /userinfo", s.preflight(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("GET /logout", s.logout)
+	mux.HandleFunc("POST /logout", s.logout)
 	return s.logRequest(mux)
 }
