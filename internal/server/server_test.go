@@ -62,7 +62,7 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 	}
 	server := &http.Server{Handler: s.Handler()}
 	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Close() })
+	t.Cleanup(func() { _ = server.Close(); s.Close() })
 	return &testProvider{baseURL: c.Issuer, server: server, listener: listener, srv: s}
 }
 
