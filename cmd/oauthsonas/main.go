@@ -25,6 +25,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8181", "listen address")
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	healthcheck := flag.Bool("healthcheck", false, "probe /healthz on the --listen address and exit 0 when healthy (for container health checks)")
 	logFormat := flag.String("log-format", "json", "log format: text or json")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
@@ -41,6 +42,13 @@ func main() {
 	}
 	if *showVersion {
 		fmt.Println(version)
+		return
+	}
+	if *healthcheck {
+		if err := runHealthcheck(*listen); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	c, err := config.Load(*configPath)
@@ -118,6 +126,39 @@ func newLogger(format, level string) (*slog.Logger, error) {
 		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
 	}
 	return nil, fmt.Errorf("invalid --log-format %q: want json or text", format)
+}
+
+// healthcheckURL turns a listen address into the /healthz URL a local probe
+// should use; wildcard hosts probe loopback.
+func healthcheckURL(listen string) (string, error) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("invalid listen address %q: %w", listen, err)
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+		if ip != nil && ip.To4() == nil {
+			host = "::1"
+		}
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/healthz", nil
+}
+
+func runHealthcheck(listen string) error {
+	target, err := healthcheckURL(listen)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(target)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned %s", target, response.Status)
+	}
+	return nil
 }
 
 func validateListenAddress(address string) error {
