@@ -62,7 +62,7 @@ services:
         condition: service_healthy
 
   e2e:
-    image: mcr.microsoft.com/playwright:v1.50.0-noble
+    image: mcr.microsoft.com/playwright:v1.50.0-noble   # keep in step with your @playwright/test version
     working_dir: /e2e
     volumes: [./e2e:/e2e]
     environment:
@@ -74,7 +74,7 @@ services:
 Do not publish the oauthsonas port beyond loopback. If your tests run on the
 host instead, publish `127.0.0.1:8181:8181`, use `http://127.0.0.1:8181` as the
 issuer everywhere, and make the backend container reach it through the same
-address (for example `network_mode: host`).
+address (for example `network_mode: host`, which behaves differently on Docker Desktop and may need to be enabled there; if in doubt, put the backend and browser in the Compose network instead).
 
 ## Signing in from Playwright
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"sync"
@@ -101,12 +102,35 @@ func TestCleanupIsSafeDuringTraffic(t *testing.T) {
 					t.Errorf("no code in %q", response.Header.Get("Location"))
 					return
 				}
-				result := exchange(t, p, client, location.Query().Get("code"), verifier)
-				token, _ := result["access_token"].(string)
+				// Not exchange(): its t.Fatal must not run off the test goroutine.
+				tokenResponse, err := client.PostForm(p.baseURL+"/oauth2/token", url.Values{
+					"grant_type": {"authorization_code"}, "client_id": {"dashboard"}, "code": {location.Query().Get("code")},
+					"redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "code_verifier": {verifier},
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				var tokens struct {
+					AccessToken string `json:"access_token"`
+				}
+				err = json.NewDecoder(tokenResponse.Body).Decode(&tokens)
+				tokenResponse.Body.Close()
+				if err != nil || tokenResponse.StatusCode != http.StatusOK || tokens.AccessToken == "" {
+					t.Errorf("token exchange failed: status=%d err=%v", tokenResponse.StatusCode, err)
+					return
+				}
 				request, _ := http.NewRequest(http.MethodGet, p.baseURL+"/userinfo", nil)
-				request.Header.Set("Authorization", "Bearer "+token)
-				if r, err := client.Do(request); err == nil {
-					r.Body.Close()
+				request.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+				infoResponse, err := client.Do(request)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				infoResponse.Body.Close()
+				if infoResponse.StatusCode != http.StatusOK {
+					t.Errorf("userinfo status = %d", infoResponse.StatusCode)
+					return
 				}
 			}
 		})

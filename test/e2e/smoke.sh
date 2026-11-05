@@ -30,6 +30,28 @@ wait_ready() { # name base
   exit 1
 }
 
+# wait_healthy NAME: wait for the image's own HEALTHCHECK to report healthy.
+# Images in OCI format (the Podman default) drop HEALTHCHECK, so the check is
+# skipped there unless REQUIRE_HEALTHCHECK=1, which CI sets for Docker builds.
+wait_healthy() {
+  local status=""
+  for _ in $(seq 1 30); do
+    status=$("$CLI" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null || true)
+    case "$status" in
+      healthy) echo "  HEALTHCHECK reports healthy"; return ;;
+      "") break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$status" ]; then
+    [ "${REQUIRE_HEALTHCHECK:-0}" = 1 ] && fail "image defines no HEALTHCHECK"
+    echo "  (image has no HEALTHCHECK, e.g. OCI format; skipped)"
+    return
+  fi
+  "$CLI" logs "$1" >&2
+  fail "HEALTHCHECK status is '$status', want healthy"
+}
+
 # json_field NAME: print the string value of a top-level JSON field from stdin.
 json_field() {
   sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
@@ -47,6 +69,9 @@ wait_ready "$NAME" "$BASE"
 echo "=== smoke: --healthcheck inside the container ==="
 "$CLI" exec "$NAME" /usr/local/bin/oauthsonas --healthcheck --listen 0.0.0.0:8181 \
   || fail "--healthcheck reported unhealthy"
+
+echo "=== smoke: container HEALTHCHECK ==="
+wait_healthy "$NAME"
 
 echo "=== smoke: /healthz /readyz discovery ==="
 curl -sf "$BASE/healthz" | grep -q '"status":"ok"' || fail "/healthz"

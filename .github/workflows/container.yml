@@ -45,6 +45,8 @@ jobs:
           tags: oauthsonas:ci
       - name: Smoke test container
         run: ./test/e2e/smoke.sh oauthsonas:ci
+        env:
+          REQUIRE_HEALTHCHECK: "1"
       # The image is built with its own Go toolchain, so scan the shipped
       # binary rather than trusting the toolchain pinned in go.mod.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

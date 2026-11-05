@@ -74,7 +74,7 @@ podman run --rm -p 127.0.0.1:8181:8181 -e OAUTHSONAS_ALLOW_NON_LOOPBACK=true oau
 
 Docker uses the same commands with `docker` in place of `podman`.
 
-The image has no shell or `curl`, so it defines a `HEALTHCHECK` that runs `oauthsonas --healthcheck` (honored by Docker; Podman needs `--format docker`). That makes Compose `depends_on: condition: service_healthy` work out of the box. See [docs/e2e-stack.md](docs/e2e-stack.md) for a complete Compose and Playwright setup.
+The image has no shell or `curl`, so it defines a `HEALTHCHECK` that runs `oauthsonas --healthcheck` (honored by Docker; Podman needs `--format docker`). That makes Compose `depends_on: condition: service_healthy` work out of the box. The check probes port `8181`; if you change `--listen`, override the health check with the same address (see `docs/e2e-stack.md`). See [docs/e2e-stack.md](docs/e2e-stack.md) for a complete Compose and Playwright setup.
 
 The container binds to `0.0.0.0` for port-forwarding to work. You must explicitly set `OAUTHSONAS_ALLOW_NON_LOOPBACK=true` to acknowledge the non-loopback exposure. Keep the published port loopback-bound (`-p 127.0.0.1:8181:8181`) as shown.
 
