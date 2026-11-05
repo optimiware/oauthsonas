@@ -1,6 +1,6 @@
 module github.com/optimiweb/oauthsonas
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/go-jose/go-jose/v3 v3.0.5
