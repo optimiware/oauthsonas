@@ -1,0 +1,148 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/optimiweb/oauthsonas/internal/config"
+)
+
+func twoClientProvider(t *testing.T) *testProvider {
+	t.Helper()
+	return newTestProviderConfig(t, 5*time.Minute, func(c *config.Config) {
+		c.Clients = append(c.Clients, config.Client{
+			ID: "other", Name: "Other", Public: true,
+			RedirectURIs:           []string{"http://127.0.0.1:6000/callback"},
+			PostLogoutRedirectURIs: []string{"http://127.0.0.1:6000/"},
+		})
+	})
+}
+
+func TestIDTokenHintIdentifiesClient(t *testing.T) {
+	t.Parallel()
+	p := twoClientProvider(t)
+	_, result := fullFlow(t, p, "acme-admin")
+	idToken := result["id_token"].(string)
+
+	clientID, err := p.srv.clientIDFromIDTokenHint(idToken)
+	if err != nil || clientID != "dashboard" {
+		t.Fatalf("clientIDFromIDTokenHint = %q, %v; want dashboard", clientID, err)
+	}
+
+	// A token issued to "dashboard" must not unlock "other"'s logout redirect.
+	client := browserClient(t)
+	response, err := client.Get(p.baseURL + "/logout?id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("http://127.0.0.1:6000/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-client logout redirect status = %d, want 400", response.StatusCode)
+	}
+
+	response, err = client.Get(p.baseURL + "/logout?id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("http://127.0.0.1:5173/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("own-client logout redirect status = %d, want 302", response.StatusCode)
+	}
+}
+
+func TestIDTokenHintRejectsForgedToken(t *testing.T) {
+	t.Parallel()
+	p := twoClientProvider(t)
+	other := twoClientProvider(t)
+	_, result := fullFlow(t, other, "acme-admin")
+
+	if id, err := p.srv.clientIDFromIDTokenHint(result["id_token"].(string)); err == nil {
+		t.Fatalf("token signed by another server accepted for client %q", id)
+	}
+}
+
+// Run with -race: cleanup must not touch fosite's maps while requests do.
+func TestCleanupIsSafeDuringTraffic(t *testing.T) {
+	t.Parallel()
+	p := newTestProvider(t, 5*time.Minute)
+	stop := make(chan struct{})
+	var cleaners sync.WaitGroup
+	cleaners.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.srv.cleanupStore()
+			}
+		}
+	})
+
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Go(func() {
+			client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			for range 10 {
+				params := validAuthorizeParams()
+				params.Set("login_hint", "acme-admin")
+				response, err := client.Get(authorizeURL(p.baseURL, params))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				response.Body.Close()
+				location, err := url.Parse(response.Header.Get("Location"))
+				if err != nil || location.Query().Get("code") == "" {
+					t.Errorf("no code in %q", response.Header.Get("Location"))
+					return
+				}
+				// Not exchange(): its t.Fatal must not run off the test goroutine.
+				tokenResponse, err := client.PostForm(p.baseURL+"/oauth2/token", url.Values{
+					"grant_type": {"authorization_code"}, "client_id": {"dashboard"}, "code": {location.Query().Get("code")},
+					"redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "code_verifier": {verifier},
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				var tokens struct {
+					AccessToken string `json:"access_token"`
+				}
+				err = json.NewDecoder(tokenResponse.Body).Decode(&tokens)
+				tokenResponse.Body.Close()
+				if err != nil || tokenResponse.StatusCode != http.StatusOK || tokens.AccessToken == "" {
+					t.Errorf("token exchange failed: status=%d err=%v", tokenResponse.StatusCode, err)
+					return
+				}
+				request, _ := http.NewRequest(http.MethodGet, p.baseURL+"/userinfo", nil)
+				request.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+				infoResponse, err := client.Do(request)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				infoResponse.Body.Close()
+				if infoResponse.StatusCode != http.StatusOK {
+					t.Errorf("userinfo status = %d", infoResponse.StatusCode)
+					return
+				}
+			}
+		})
+	}
+	workers.Wait()
+	close(stop)
+	cleaners.Wait()
+}
+
+func TestCloseStopsCleanupAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+	p := newTestProvider(t, 5*time.Minute)
+	p.srv.Close()
+	p.srv.Close()
+}

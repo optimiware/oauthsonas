@@ -29,6 +29,7 @@ type testProvider struct {
 	baseURL  string
 	server   *http.Server
 	listener net.Listener
+	srv      *Server
 }
 
 type testInteraction struct {
@@ -48,7 +49,7 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 		t.Fatal(err)
 	}
 	c := testConfig("http://" + listener.Addr().String())
-	c.AuthorizationCodeTTL = codeTTL.String()
+	c.AuthorizationCodeTTL = config.Duration(codeTTL)
 	if mutate != nil {
 		mutate(c)
 	}
@@ -61,13 +62,13 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 	}
 	server := &http.Server{Handler: s.Handler()}
 	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Close() })
-	return &testProvider{baseURL: c.Issuer, server: server, listener: listener}
+	t.Cleanup(func() { _ = server.Close(); s.Close() })
+	return &testProvider{baseURL: c.Issuer, server: server, listener: listener, srv: s}
 }
 
 func testConfig(issuer string) *config.Config {
 	return &config.Config{
-		Issuer: issuer, APIAudience: "https://api.optimicdn.test", TokenTTL: "15m", AuthorizationCodeTTL: "5m", RefreshTokenTTL: "8h",
+		Issuer: issuer, APIAudience: "https://api.example.test", TokenTTL: config.Duration(15 * time.Minute), AuthorizationCodeTTL: config.Duration(5 * time.Minute), RefreshTokenTTL: config.Duration(8 * time.Hour),
 		Clients: []config.Client{{ID: "dashboard", Name: "Dashboard", Public: true, RedirectURIs: []string{"http://127.0.0.1:5173/auth/callback"}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:5173/"}, AllowedOrigins: []string{"http://127.0.0.1:5173"}}},
 		Personas: []config.Persona{
 			{ID: "acme-admin", Subject: "oauthsonas|acme-admin", Email: "admin@acme.dev.optimi.test", Name: "Acme Administrator", OrganizationID: "org_acme", Roles: []string{"customer-admin"}},
@@ -95,7 +96,7 @@ func authorizeURL(base string, params url.Values) string {
 }
 
 func validAuthorizeParams() url.Values {
-	return url.Values{"response_type": {"code"}, "client_id": {"dashboard"}, "redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "scope": {"openid profile email"}, "state": {"state-value-123"}, "nonce": {"nonce-value-123"}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"}, "audience": {"https://api.optimicdn.test"}}
+	return url.Values{"response_type": {"code"}, "client_id": {"dashboard"}, "redirect_uri": {"http://127.0.0.1:5173/auth/callback"}, "scope": {"openid profile email"}, "state": {"state-value-123"}, "nonce": {"nonce-value-123"}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"}, "audience": {"https://api.example.test"}}
 }
 
 func begin(t *testing.T, p *testProvider, client *http.Client, params url.Values) testInteraction {
@@ -167,7 +168,7 @@ func fullFlow(t *testing.T, p *testProvider, persona string) (*http.Client, map[
 	interaction := begin(t, p, client, validAuthorizeParams())
 	code := selectPersona(t, p, client, interaction, persona)
 	result := exchange(t, p, client, code, verifier)
-	if result["_status"] != float64(http.StatusOK) && result["_status"] != http.StatusOK {
+	if result["_status"] != http.StatusOK {
 		t.Fatalf("token exchange: %#v", result)
 	}
 	return client, result
@@ -200,6 +201,7 @@ func jwtClaims(t *testing.T, p *testProvider, token string) map[string]interface
 }
 
 func TestDiscoveryAndFullAuthorizationCodeFlow(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	response, err := http.Get(p.baseURL + "/.well-known/openid-configuration")
 	if err != nil {
@@ -235,7 +237,7 @@ func TestDiscoveryAndFullAuthorizationCodeFlow(t *testing.T) {
 	if _, ok := access["email"]; ok {
 		t.Fatalf("access token must not contain profile claims: %#v", access)
 	}
-	if !containsString(access["aud"], "https://api.optimicdn.test") || !containsString(access["roles"], "customer-admin") || access["org_id"] != "org_acme" {
+	if !containsString(access["aud"], "https://api.example.test") || !containsString(access["roles"], "customer-admin") || access["org_id"] != "org_acme" {
 		t.Fatalf("bad access claims: %#v", access)
 	}
 	if id["iss"] != p.baseURL || id["sub"] != "oauthsonas|acme-admin" || id["nonce"] != "nonce-value-123" || !containsString(id["aud"], "dashboard") {
@@ -274,6 +276,7 @@ func TestDiscoveryAndFullAuthorizationCodeFlow(t *testing.T) {
 }
 
 func TestStaffPersonaHasNoOrganization(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	_, result := fullFlow(t, p, "operator")
 	claims := jwtClaims(t, p, result["access_token"].(string))
@@ -283,6 +286,7 @@ func TestStaffPersonaHasNoOrganization(t *testing.T) {
 }
 
 func TestOAuth2ClientAuthorizationCodeFlow(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	browser := browserClient(t)
 	oauthClient := &oauth2.Config{
@@ -299,7 +303,7 @@ func TestOAuth2ClientAuthorizationCodeFlow(t *testing.T) {
 		"state-value-123",
 		oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("nonce", "nonce-value-123"),
-		oauth2.SetAuthURLParam("audience", "https://api.optimicdn.test"),
+		oauth2.SetAuthURLParam("audience", "https://api.example.test"),
 	)
 	u, err := url.Parse(authorizeURL)
 	if err != nil {
@@ -339,6 +343,7 @@ func TestOAuth2ClientAuthorizationCodeFlow(t *testing.T) {
 }
 
 func TestPublicClientRejectsSecretAuthentication(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	interaction := begin(t, p, client, validAuthorizeParams())
@@ -361,6 +366,7 @@ func TestPublicClientRejectsSecretAuthentication(t *testing.T) {
 }
 
 func TestAuthorizationFailuresAndCodeReuse(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	cases := []struct {
@@ -390,23 +396,24 @@ func TestAuthorizationFailuresAndCodeReuse(t *testing.T) {
 	interaction := begin(t, p, client, validAuthorizeParams())
 	code := selectPersona(t, p, client, interaction, "acme-admin")
 	wrong := exchange(t, p, client, code, verifier+"x")
-	if wrong["_status"] != float64(http.StatusBadRequest) && wrong["_status"] != http.StatusBadRequest {
+	if wrong["_status"] != http.StatusBadRequest {
 		t.Fatalf("wrong verifier accepted: %#v", wrong)
 	}
 	// PKCE request sessions are one-time too; issue a fresh code for reuse validation.
 	interaction = begin(t, p, client, validAuthorizeParams())
 	code = selectPersona(t, p, client, interaction, "acme-admin")
 	first := exchange(t, p, client, code, verifier)
-	if first["_status"] != float64(http.StatusOK) && first["_status"] != http.StatusOK {
+	if first["_status"] != http.StatusOK {
 		t.Fatalf("first exchange failed: %#v", first)
 	}
 	second := exchange(t, p, client, code, verifier)
-	if second["_status"] != float64(http.StatusBadRequest) && second["_status"] != http.StatusBadRequest {
+	if second["_status"] != http.StatusBadRequest {
 		t.Fatalf("reused code accepted: %#v", second)
 	}
 }
 
 func TestExplicitQueryResponseMode(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -418,6 +425,7 @@ func TestExplicitQueryResponseMode(t *testing.T) {
 }
 
 func TestParallelBrowserInteractions(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	first := begin(t, p, client, validAuthorizeParams())
@@ -431,6 +439,7 @@ func TestParallelBrowserInteractions(t *testing.T) {
 }
 
 func TestExpiredCodeAndInteractionTampering(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Millisecond)
 	client := browserClient(t)
 	interaction := begin(t, p, client, validAuthorizeParams())
@@ -454,12 +463,13 @@ func TestExpiredCodeAndInteractionTampering(t *testing.T) {
 	code := selectPersona(t, p, client, interaction, "acme-admin")
 	time.Sleep(20 * time.Millisecond)
 	result := exchange(t, p, client, code, verifier)
-	if result["_status"] != float64(http.StatusBadRequest) && result["_status"] != http.StatusBadRequest {
+	if result["_status"] != http.StatusBadRequest {
 		t.Fatalf("expired code accepted: %#v", result)
 	}
 }
 
 func TestCORSAndLogoutValidation(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	request, _ := http.NewRequest(http.MethodOptions, p.baseURL+"/.well-known/openid-configuration", nil)
 	request.Header.Set("Origin", "http://127.0.0.1:5173")
@@ -502,6 +512,7 @@ func TestCORSAndLogoutValidation(t *testing.T) {
 }
 
 func TestPersonaPickerSecurityHeaders(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	response, err := client.Get(authorizeURL(p.baseURL, validAuthorizeParams()))
@@ -523,6 +534,7 @@ func TestPersonaPickerSecurityHeaders(t *testing.T) {
 }
 
 func TestOfflineAccessRefreshRotationAndReuseRejection(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -583,6 +595,7 @@ func TestOfflineAccessRefreshRotationAndReuseRejection(t *testing.T) {
 }
 
 func TestRefreshScopeValidationAndDownscoping(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -633,6 +646,7 @@ func containsString(value interface{}, wanted string) bool {
 }
 
 func TestHealthz(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	response, err := http.Get(p.baseURL + "/healthz")
 	if err != nil {
@@ -664,6 +678,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestReadyz(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	response, err := http.Get(p.baseURL + "/readyz")
 	if err != nil {
@@ -686,6 +701,7 @@ func TestReadyz(t *testing.T) {
 }
 
 func TestSelectPersonaRejectsDuplicateParams(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	interaction := begin(t, p, client, validAuthorizeParams())
@@ -710,6 +726,7 @@ func TestSelectPersonaRejectsDuplicateParams(t *testing.T) {
 }
 
 func TestIDTokenHintLogout(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	_, result := fullFlow(t, p, "acme-admin")
 	idToken := result["id_token"].(string)
@@ -726,6 +743,7 @@ func TestIDTokenHintLogout(t *testing.T) {
 }
 
 func TestLoginHintCompletesAuthorize(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	params := validAuthorizeParams()
@@ -752,7 +770,7 @@ func TestLoginHintCompletesAuthorize(t *testing.T) {
 		t.Fatalf("code absent from %s", location)
 	}
 	result := exchange(t, p, client, code, verifier)
-	if result["_status"] != float64(http.StatusOK) && result["_status"] != http.StatusOK {
+	if result["_status"] != http.StatusOK {
 		t.Fatalf("token exchange: %#v", result)
 	}
 	claims := jwtClaims(t, p, result["id_token"].(string))
@@ -762,6 +780,7 @@ func TestLoginHintCompletesAuthorize(t *testing.T) {
 }
 
 func TestLoginHintUnknownRendersPicker(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -770,6 +789,7 @@ func TestLoginHintUnknownRendersPicker(t *testing.T) {
 }
 
 func TestLoginHintRepeatedRejected(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -799,6 +819,7 @@ func TestLoginHintRepeatedRejected(t *testing.T) {
 }
 
 func TestPersonaPickerDataAttributes(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	response, err := client.Get(authorizeURL(p.baseURL, validAuthorizeParams()))
@@ -861,6 +882,7 @@ func gateIn(t *testing.T, p *testProvider, client *http.Client, returnTo string)
 }
 
 func TestAccessCodeGateFlow(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -925,6 +947,7 @@ func TestAccessCodeGateFlow(t *testing.T) {
 }
 
 func TestAccessCodeGateBlocksLoginHint(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	params := validAuthorizeParams()
@@ -955,6 +978,7 @@ func TestAccessCodeGateBlocksLoginHint(t *testing.T) {
 }
 
 func TestAccessCodeGateSelectRequiresCookie(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	gateIn(t, p, client, "/oauth2/auth")
@@ -972,6 +996,7 @@ func TestAccessCodeGateSelectRequiresCookie(t *testing.T) {
 }
 
 func TestAccessCodeGateRejectsBadReturnTo(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	for _, raw := range []string{"", "https://evil.test/oauth2/auth", "//evil.test/oauth2/auth", "/logout", "/oauth2/authx", "/oauth2/auth#fragment"} {
@@ -990,6 +1015,7 @@ func TestAccessCodeGateRejectsBadReturnTo(t *testing.T) {
 }
 
 func TestAccessCodeGateRejectsDuplicateFields(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	for name, values := range map[string]url.Values{
@@ -1008,6 +1034,7 @@ func TestAccessCodeGateRejectsDuplicateFields(t *testing.T) {
 }
 
 func TestAccessCodeGatePageSecurityHeaders(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	client := browserClient(t)
 	response, err := client.Get(authorizeURL(p.baseURL, validAuthorizeParams()))
@@ -1029,6 +1056,7 @@ func TestAccessCodeGatePageSecurityHeaders(t *testing.T) {
 }
 
 func TestAccessCodeGateLeavesProtocolEndpointsOpen(t *testing.T) {
+	t.Parallel()
 	p := gatedProvider(t)
 	for _, path := range []string{"/.well-known/openid-configuration", "/.well-known/jwks.json", "/healthz", "/readyz"} {
 		response, err := http.Get(p.baseURL + path)
@@ -1043,6 +1071,7 @@ func TestAccessCodeGateLeavesProtocolEndpointsOpen(t *testing.T) {
 }
 
 func TestAccessCodeGateDisabled(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 

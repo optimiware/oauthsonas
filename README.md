@@ -45,6 +45,12 @@ Validate a configuration without starting the server:
 go run ./cmd/oauthsonas --config config.example.yaml --check-config
 ```
 
+Check a running instance (exit status 0 when `/healthz` answers 200), for example from a container health check:
+
+```sh
+oauthsonas --healthcheck --listen 127.0.0.1:8181
+```
+
 Print the build version:
 
 ```sh
@@ -68,6 +74,8 @@ podman run --rm -p 127.0.0.1:8181:8181 -e OAUTHSONAS_ALLOW_NON_LOOPBACK=true oau
 
 Docker uses the same commands with `docker` in place of `podman`.
 
+The image has no shell or `curl`, so it defines a `HEALTHCHECK` that runs `oauthsonas --healthcheck` (honored by Docker; Podman needs `--format docker`). That makes Compose `depends_on: condition: service_healthy` work out of the box. The check probes port `8181`; if you change `--listen`, override the health check with the same address (see `docs/e2e-stack.md`). See [docs/e2e-stack.md](docs/e2e-stack.md) for a complete Compose and Playwright setup.
+
 The container binds to `0.0.0.0` for port-forwarding to work. You must explicitly set `OAUTHSONAS_ALLOW_NON_LOOPBACK=true` to acknowledge the non-loopback exposure. Keep the published port loopback-bound (`-p 127.0.0.1:8181:8181`) as shown.
 
 Published releases are available from GitHub Container Registry after a SemVer Git tag is pushed:
@@ -89,7 +97,7 @@ OIDC_CLIENT_ID=dashboard
 OIDC_REDIRECT_URI=http://127.0.0.1:5173/auth/callback
 OIDC_POST_LOGOUT_REDIRECT_URI=http://127.0.0.1:5173/
 OIDC_SCOPE="openid profile email"
-OIDC_AUDIENCE=https://api.optimicdn.test
+OIDC_AUDIENCE=https://api.example.test
 ```
 
 The example client is public and requires S256 PKCE. The authorization page lets a developer select a configured persona; it then redirects to the dashboard callback with a normal authorization code and unchanged `state`.
@@ -202,7 +210,10 @@ JWT `aud` values are serialized as JSON arrays by Fosite, which is valid JWT/OID
 - Supplying `scope` to a refresh request can only downscope. The narrower scope set becomes the grant for the rotated refresh token.
 - Authorization codes are short-lived and one-time. State is returned unchanged. Nonces are copied to ID tokens.
 - `GET` or `POST /userinfo` validates the bearer access token and returns the granted profile/custom claim subset.
-- `GET /logout` redirects only to a registered `post_logout_redirect_uri` and returns an optional `state` value. When an `id_token_hint` is provided, the client is derived from the token's `aud` claim, supporting RP-initiated logout without an explicit `client_id`.
+- `GET` or `POST /logout` redirects only to a registered `post_logout_redirect_uri` and returns an optional `state` value. When an `id_token_hint` is provided and was signed by this server instance, the client is derived from the token's `aud` claim, supporting RP-initiated logout without an explicit `client_id`; the redirect must then belong to that client. If a `client_id` is also supplied it must match the hint, otherwise the request fails with `400`. A hint signed by a previous run (the signing key changes on restart) is ignored with a warning.
+- `prompt=none` always fails immediately with `login_required` (redirected to `redirect_uri` with `state`): the server keeps no login session, so silent renewal cannot succeed. Use refresh tokens (`offline_access`) instead of iframe renewal. `login`, `consent`, and `select_account` show the picker; other values, or `none` combined with anything, return `invalid_request`.
+- `HEAD /oauth2/auth` returns `405`, so link previewers and probes cannot trigger an automatic `login_hint` login.
+- The token endpoint reads parameters from the POST body only. CORS is applied per client; `/userinfo` errors (such as `401`) also carry CORS headers for registered origins so browser apps can read them.
 
 ## Health and readiness
 
@@ -237,6 +248,7 @@ Log attributes for each request: `method`, `path`, `status`, `duration`. Additio
 | `select_persona` | `client_id`, `persona_id`, `interaction_id` (truncated), `status` |
 | `token` | `client_id`, `grant_type`, `status`, `error_category` |
 | `logout` | `client_id`, `status` |
+| `gate` | `status` (`success` or `error` with `error_category=auth`) |
 
 Never logged: authorization codes, access tokens, refresh tokens, ID tokens, cookies, CSRF values, or PKCE verifiers.
 
@@ -254,7 +266,7 @@ The server performs periodic garbage collection of expired in-memory state. For 
 
 ## Browser automation
 
-The persona picker exposes stable selectors for test frameworks. The form contract for `POST /oauth2/auth/select` is versioned (see handler godoc for details).
+The persona picker exposes stable selectors for test frameworks. The form contract for `POST /oauth2/auth/select` is versioned and documented below; this section is the single source of truth.
 
 ### Selectors
 
@@ -270,14 +282,14 @@ The persona picker exposes stable selectors for test frameworks. The form contra
 
 ### Flow
 
-Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the same request 302s to `redirect_uri` with `code` and `state`. Use this from agents and `oidc-client-ts` (`extraQueryParams: { login_hint }`). Unknown or missing hints still render the picker. A configured access code is always required first.
+Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the same request answers `303 See Other` with a `Location` of `redirect_uri` with `code` and `state`. Use this from agents and `oidc-client-ts` (`extraQueryParams: { login_hint }`). Unknown or missing hints still render the picker. A configured access code is always required first.
 
 0. If the server has an `access_code`, `GET /oauth2/auth` returns the access-code form (HTTP 200) instead of completing anything, with the original request URI in a hidden `return_to` field. Submit `POST /oauth2/gate` with form fields `code` and `return_to`; on success the response is a 303 back to `return_to` and sets the `oauthsonas_gate` cookie. A wrong code returns HTTP 401 and the form again.
 1. Navigate to `GET /oauth2/auth?...` with standard OIDC params.
 2. The response page contains one `<form>` per persona with the selectors above.
 3. Extract `csrf` and `interaction_id` from the hidden inputs.
 4. Submit `POST /oauth2/auth/select` with form fields `csrf`, `interaction_id`, and `persona`.
-5. The server responds with a 302 redirect to the registered `redirect_uri` containing `code` and `state`.
+5. The server responds with a `303 See Other` redirect to the registered `redirect_uri` containing `code` and `state`.
 6. Exchange the code at `POST /oauth2/token` as usual.
 
 ### Requirements
@@ -298,13 +310,16 @@ Optional `login_hint=<persona id>` on `GET /oauth2/auth` skips the picker: the s
 - `POST /oauth2/gate`
 - `POST /oauth2/token`
 - `GET|POST /userinfo`
-- `GET /logout`
+- `GET|POST /logout`
 
 ## Test
 
 ```sh
 go test -race ./...
+go vet ./...
 ```
+
+CI also enforces `gofmt`, `go mod tidy`, `staticcheck`, and `govulncheck`.
 
 There is intentionally no database, password flow, admin API, user-provisioning UI, Auth0 Organizations API, Management API, external identity provider, or production deployment manifest.
 

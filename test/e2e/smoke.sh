@@ -1,86 +1,139 @@
 #!/usr/bin/env bash
+# Smoke-test a built oauthsonas image: start it, check the probes, and complete
+# a real authorization-code + PKCE login. Set CONTAINER_CLI=podman to use Podman.
 set -euo pipefail
 
 IMAGE="${1:-ghcr.io/optimiweb/oauthsonas:latest}"
+CLI="${CONTAINER_CLI:-docker}"
 NAME="oauthsonas-smoke-$$"
 
 cleanup() {
-  docker rm -f "$NAME" "$NAME-gate" 2>/dev/null || true
+  "$CLI" rm -f "$NAME" "$NAME-gate" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
+fail() {
+  echo "  FAIL: $*" >&2
+  exit 1
+}
+
+wait_ready() { # name base
+  for i in $(seq 1 30); do
+    if curl -sf "$2/healthz" >/dev/null 2>&1; then
+      echo "  ready after ${i}s"
+      return
+    fi
+    sleep 1
+  done
+  echo "  server did not start within 30s" >&2
+  "$CLI" logs "$1" >&2
+  exit 1
+}
+
+# wait_healthy NAME: wait for the image's own HEALTHCHECK to report healthy.
+# Images in OCI format (the Podman default) drop HEALTHCHECK, so the check is
+# skipped there unless REQUIRE_HEALTHCHECK=1, which CI sets for Docker builds.
+wait_healthy() {
+  local status=""
+  for _ in $(seq 1 30); do
+    status=$("$CLI" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null || true)
+    case "$status" in
+      healthy) echo "  HEALTHCHECK reports healthy"; return ;;
+      "") break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$status" ]; then
+    [ "${REQUIRE_HEALTHCHECK:-0}" = 1 ] && fail "image defines no HEALTHCHECK"
+    echo "  (image has no HEALTHCHECK, e.g. OCI format; skipped)"
+    return
+  fi
+  "$CLI" logs "$1" >&2
+  fail "HEALTHCHECK status is '$status', want healthy"
+}
+
+# json_field NAME: print the string value of a top-level JSON field from stdin.
+json_field() {
+  sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
+}
+
 echo "=== smoke: --version ==="
-docker run --rm "$IMAGE" --version
-echo ""
+"$CLI" run --rm "$IMAGE" --version
 
 echo "=== smoke: default CMD (start server) ==="
-docker run -d --rm --name "$NAME" -e OAUTHSONAS_ALLOW_NON_LOOPBACK=true -p 0:8181 "$IMAGE"
-PORT=$(docker port "$NAME" 8181 | head -1 | cut -d: -f2)
+"$CLI" run -d --rm --name "$NAME" -e OAUTHSONAS_ALLOW_NON_LOOPBACK=true -p 127.0.0.1::8181 "$IMAGE" >/dev/null
+PORT=$("$CLI" port "$NAME" 8181 | head -1 | awk -F: '{print $NF}')
 BASE="http://127.0.0.1:${PORT}"
+wait_ready "$NAME" "$BASE"
 
-for i in $(seq 1 30); do
-  if curl -sf "$BASE/healthz" > /dev/null 2>&1; then
-    echo "  server ready after ${i}s"
-    break
-  fi
-  if [ "$i" -eq 30 ]; then
-    echo "  server did not start within 30s" >&2
-    docker logs "$NAME"
-    exit 1
-  fi
-  sleep 1
+echo "=== smoke: --healthcheck inside the container ==="
+"$CLI" exec "$NAME" /usr/local/bin/oauthsonas --healthcheck --listen 0.0.0.0:8181 \
+  || fail "--healthcheck reported unhealthy"
+
+echo "=== smoke: container HEALTHCHECK ==="
+wait_healthy "$NAME"
+
+echo "=== smoke: /healthz /readyz discovery ==="
+curl -sf "$BASE/healthz" | grep -q '"status":"ok"' || fail "/healthz"
+curl -sf "$BASE/readyz" | grep -q '"status":"ready"' || fail "/readyz"
+DISC=$(curl -sf "$BASE/.well-known/openid-configuration")
+for field in authorization_endpoint token_endpoint jwks_uri userinfo_endpoint; do
+  echo "$DISC" | grep -q "\"$field\"" || fail "discovery is missing $field"
 done
 
-echo "=== smoke: /healthz ==="
-HEALTH=$(curl -sf "$BASE/healthz")
-echo "  $HEALTH"
-echo "$HEALTH" | grep -q '"status":"ok"'
-echo "$HEALTH" | grep -q '"issuer"'
+echo "=== smoke: full login (authorize -> token -> userinfo) ==="
+REDIRECT_URI="http://127.0.0.1:5173/auth/callback"
+VERIFIER=$(openssl rand -hex 32)
+CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+HEADERS=$(curl -s -o /dev/null -D - -G "$BASE/oauth2/auth" \
+  --data-urlencode "response_type=code" \
+  --data-urlencode "client_id=dashboard" \
+  --data-urlencode "redirect_uri=$REDIRECT_URI" \
+  --data-urlencode "scope=openid profile email" \
+  --data-urlencode "state=smoke-state" \
+  --data-urlencode "nonce=smoke-nonce-0123456789" \
+  --data-urlencode "code_challenge=$CHALLENGE" \
+  --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "login_hint=acme-admin" | tr -d '\r')
+LOCATION=$(echo "$HEADERS" | sed -n 's/^[Ll]ocation: //p')
+echo "$LOCATION" | grep -q "^$REDIRECT_URI" || fail "authorize did not redirect to the callback: $LOCATION"
+echo "$LOCATION" | grep -q "state=smoke-state" || fail "state was not preserved: $LOCATION"
+CODE=$(echo "$LOCATION" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+[ -n "$CODE" ] || fail "no authorization code in $LOCATION"
 
-echo "=== smoke: /readyz ==="
-READY=$(curl -sf "$BASE/readyz")
-echo "  $READY"
-echo "$READY" | grep -q '"status":"ready"'
+TOKENS=$(curl -sf -X POST "$BASE/oauth2/token" \
+  -d "grant_type=authorization_code" -d "client_id=dashboard" -d "code=$CODE" \
+  --data-urlencode "redirect_uri=$REDIRECT_URI" -d "code_verifier=$VERIFIER") || fail "token exchange failed"
+ACCESS=$(echo "$TOKENS" | json_field access_token)
+[ -n "$ACCESS" ] || fail "no access_token in $TOKENS"
+echo "$TOKENS" | grep -q '"id_token"' || fail "no id_token in token response"
 
-echo "=== smoke: /.well-known/openid-configuration ==="
-DISC=$(curl -sf "$BASE/.well-known/openid-configuration")
-echo "  issuer: $(echo "$DISC" | grep -o '"issuer":"[^"]*"')"
-echo "$DISC" | grep -q '"authorization_endpoint"'
-echo "$DISC" | grep -q '"token_endpoint"'
-echo "$DISC" | grep -q '"jwks_uri"'
+USERINFO=$(curl -sf -H "Authorization: Bearer $ACCESS" "$BASE/userinfo") || fail "userinfo rejected the access token"
+echo "  userinfo: $USERINFO"
+echo "$USERINFO" | grep -q '"sub":"oauthsonas|acme-admin"' || fail "unexpected userinfo subject"
+
+REUSE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/oauth2/token" \
+  -d "grant_type=authorization_code" -d "client_id=dashboard" -d "code=$CODE" \
+  --data-urlencode "redirect_uri=$REDIRECT_URI" -d "code_verifier=$VERIFIER")
+[ "$REUSE" = "400" ] || fail "authorization code reuse returned $REUSE, want 400"
 
 echo ""
 echo "=== smoke: access code gate ==="
 GATE_CODE="smoke-access-code-0123456789"
-docker run -d --rm --name "$NAME-gate" \
+"$CLI" run -d --rm --name "$NAME-gate" \
   -e OAUTHSONAS_ALLOW_NON_LOOPBACK=true \
   -e OAUTHSONAS_ACCESS_CODE="$GATE_CODE" \
-  -p 0:8181 "$IMAGE"
-GATE_PORT=$(docker port "$NAME-gate" 8181 | head -1 | cut -d: -f2)
+  -p 127.0.0.1::8181 "$IMAGE" >/dev/null
+GATE_PORT=$("$CLI" port "$NAME-gate" 8181 | head -1 | awk -F: '{print $NF}')
 GATE_BASE="http://127.0.0.1:${GATE_PORT}"
-for i in $(seq 1 30); do
-  if curl -sf "$GATE_BASE/healthz" > /dev/null 2>&1; then
-    echo "  gated server ready after ${i}s"
-    break
-  fi
-  if [ "$i" -eq 30 ]; then
-    echo "  gated server did not start within 30s" >&2
-    docker logs "$NAME-gate"
-    exit 1
-  fi
-  sleep 1
-done
-GATE_PAGE=$(curl -sf "$GATE_BASE/oauth2/auth")
-echo "$GATE_PAGE" | grep -q 'access-code-input'
+wait_ready "$NAME-gate" "$GATE_BASE"
+curl -sf "$GATE_BASE/oauth2/auth" | grep -q 'access-code-input' || fail "gate page not served"
 WRONG=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GATE_BASE/oauth2/gate" \
   --data-urlencode 'return_to=/oauth2/auth' --data-urlencode 'code=definitely-wrong')
-echo "  wrong code: $WRONG"
-[ "$WRONG" = "401" ]
+[ "$WRONG" = "401" ] || fail "wrong code returned $WRONG, want 401"
 RIGHT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GATE_BASE/oauth2/gate" \
   --data-urlencode 'return_to=/oauth2/auth' --data-urlencode "code=${GATE_CODE}")
-echo "  valid code: $RIGHT"
-[ "$RIGHT" = "303" ]
-docker rm -f "$NAME-gate"
+[ "$RIGHT" = "303" ] || fail "valid code returned $RIGHT, want 303"
 
 echo ""
 echo "=== smoke: PASS ==="

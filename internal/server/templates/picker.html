@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Select a test persona</title><style>
+body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem}
+ul{padding:0;list-style:none}
+li{border:1px solid #ccd;border-radius:.5rem;margin:.75rem 0;padding:1rem}
+button{font:inherit;padding:.45rem .8rem;cursor:pointer}
+.meta{color:#445;margin:.25rem 0}
+.roles{font-family:ui-monospace,monospace}
+</style></head><body><main><h1>Select a test persona</h1><p>This local development server will complete a real OpenID Connect authorization flow.</p><ul>
+{{range .Personas}}<li><strong class="persona-name">{{.Name}}</strong><div class="meta persona-email">{{.Email}}</div><div class="meta roles">roles: {{range $i, $r := .Roles}}{{if $i}}, {{end}}{{$r}}{{end}}</div>{{if .OrganizationID}}<div class="meta">organization: {{.OrganizationID}}</div>{{end}}{{if .Memberships}}<div class="meta">memberships: {{range $i, $m := .Memberships}}{{if $i}}, {{end}}{{$m}}{{end}}</div>{{end}}<form method="post" action="/oauth2/auth/select" data-testid="persona-form-{{.ID}}" class="persona-form"><input type="hidden" name="csrf" value="{{$.CSRF}}" data-testid="csrf-input"><input type="hidden" name="interaction_id" value="{{$.InteractionID}}" data-testid="interaction-id-input"><button name="persona" value="{{.ID}}" type="submit" data-testid="persona-select-{{.ID}}">Continue as {{.Name}}</button></form></li>
+{{end}}</ul></main></body></html>

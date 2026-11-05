@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Enter the access code</title><style>
+body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem}
+form{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+input{font:inherit;padding:.45rem .6rem;width:22rem;max-width:100%}
+button{font:inherit;padding:.45rem .8rem;cursor:pointer}
+.error{color:#a00}
+</style></head><body><main><h1>Enter the access code</h1><p>This development server requires a shared access code before the persona picker.</p><form method="post" action="/oauth2/gate"><input type="hidden" name="return_to" value="{{.ReturnTo}}"><input type="password" name="code" autocomplete="off" required autofocus data-testid="access-code-input"><button type="submit" data-testid="access-code-submit">Continue</button></form>{{if .Error}}<p class="error" data-testid="access-code-error">{{.Error}}</p>{{end}}</main></body></html>
