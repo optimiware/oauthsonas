@@ -5,8 +5,8 @@ go 1.26.9
 require (
 	github.com/go-jose/go-jose/v3 v3.0.5
 	github.com/ory/fosite v0.49.0
+	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/oauth2 v0.37.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -67,7 +67,6 @@ require (
 	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.1 // indirect
-	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/net v0.62.0 // indirect

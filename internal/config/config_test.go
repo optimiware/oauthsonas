@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
@@ -197,27 +198,98 @@ func TestValidateAccessCode(t *testing.T) {
 	}
 }
 
-func TestApplyEnvAccessCode(t *testing.T) {
-	t.Setenv("OAUTHSONAS_ACCESS_CODE", "")
-	c := accessCodeConfig("file-configured-code")
-	if err := c.Validate(); err != nil {
+const minimalYAML = `issuer: http://127.0.0.1:8181
+api_audience: https://api.example.test
+%s
+clients:
+  - id: dashboard
+    name: Dashboard
+    public: true
+    redirect_uris: [http://127.0.0.1:5173/callback]
+personas:
+  - id: user
+    subject: oauthsonas|user
+    email: user@example.test
+    name: User
+    roles: [viewer]
+`
+
+func writeConfig(t *testing.T, extra string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(strings.Replace(minimalYAML, "%s", extra, 1)), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ApplyEnv(c); err != nil {
-		t.Fatalf("empty env override must disable the gate: %v", err)
+	return path
+}
+
+func TestLoadAccessCodeEnvOverride(t *testing.T) {
+	path := writeConfig(t, "access_code: file-configured-code")
+
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "")
+	c, err := Load(path)
+	if err != nil || c.AccessCode != "" {
+		t.Fatalf("empty env override must disable the gate: code=%q err=%v", c.AccessCode, err)
 	}
-	if c.AccessCode != "" {
-		t.Fatalf("env override not applied: %q", c.AccessCode)
-	}
+
 	t.Setenv("OAUTHSONAS_ACCESS_CODE", "environment-access-code")
-	if err := ApplyEnv(c); err != nil {
-		t.Fatalf("valid env override rejected: %v", err)
+	c, err = Load(path)
+	if err != nil || c.AccessCode != "environment-access-code" {
+		t.Fatalf("env override not applied: code=%q err=%v", c.AccessCode, err)
 	}
-	if c.AccessCode != "environment-access-code" {
-		t.Fatalf("env override not applied: %q", c.AccessCode)
-	}
+
 	t.Setenv("OAUTHSONAS_ACCESS_CODE", "short")
-	if err := ApplyEnv(c); err == nil || !strings.Contains(err.Error(), "at least 16") {
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "at least 16") {
 		t.Fatalf("invalid env override accepted: %v", err)
+	}
+}
+
+func TestLoadDurations(t *testing.T) {
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "")
+	c, err := Load(writeConfig(t, "token_ttl: 30m\nrefresh_token_ttl: 24h"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TokenTTL.D() != 30*time.Minute || c.RefreshTokenTTL.D() != 24*time.Hour {
+		t.Fatalf("durations = %v, %v", c.TokenTTL.D(), c.RefreshTokenTTL.D())
+	}
+	if c.AuthorizationCodeTTL.D() != 5*time.Minute {
+		t.Fatalf("authorization_code_ttl default = %v", c.AuthorizationCodeTTL.D())
+	}
+	for _, bad := range []string{"token_ttl: 900", "token_ttl: soon", "token_ttl: -5m", "token_ttl: 0s"} {
+		if _, err := Load(writeConfig(t, bad)); err == nil || !strings.Contains(err.Error(), "positive Go duration") {
+			t.Errorf("%q: want duration error, got %v", bad, err)
+		}
+	}
+}
+
+func TestValidateReportsEveryProblem(t *testing.T) {
+	c := &Config{
+		Issuer:      "not-a-url",
+		APIAudience: "",
+		AccessCode:  "short",
+		Clients:     []Client{{ID: "dashboard", Name: "Dashboard", Public: false}},
+		Personas:    []Persona{{ID: "one"}},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("invalid config accepted")
+	}
+	for _, want := range []string{"issuer", "api_audience is required", "at least 16", "must set public", "at least one redirect_uri", "persona 0 requires"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%v", want, err)
+		}
+	}
+}
+
+func TestValidateOrigins(t *testing.T) {
+	c := accessCodeConfig("")
+	c.Clients[0].AllowedOrigins = []string{"http://127.0.0.1:5173/path"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "scheme and host only") {
+		t.Fatalf("origin with a path accepted: %v", err)
+	}
+	c.Clients[0].AllowedOrigins = []string{"http://127.0.0.1:5173"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid origin rejected: %v", err)
 	}
 }

@@ -114,7 +114,7 @@ func (s *Server) cleanupStore() {
 	s.storeMu.Lock()
 	defer s.storeMu.Unlock()
 	now := time.Now()
-	codeTTL, accessTTL, refreshTTL := s.config.AuthorizationCodeTTLD, s.config.TokenTTLDuration, s.config.RefreshTokenTTLDuration
+	codeTTL, accessTTL, refreshTTL := s.config.AuthorizationCodeTTL.D(), s.config.TokenTTL.D(), s.config.RefreshTokenTTL.D()
 	for id, req := range s.store.AuthorizeCodes {
 		if expired(req, fosite.AuthorizeCode, codeTTL, now) {
 			delete(s.store.AuthorizeCodes, id)

@@ -29,15 +29,11 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
 
-	level := parseLogLevel(*logLevel)
-	var handler slog.Handler
-	switch *logFormat {
-	case "text":
-		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	default:
-		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	logger, err := newLogger(*logFormat, *logLevel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
-	logger := slog.New(handler)
 
 	if flag.NArg() != 0 {
 		logger.Error("unexpected positional arguments", "args", strings.Join(flag.Args(), " "))
@@ -50,10 +46,6 @@ func main() {
 	c, err := config.Load(*configPath)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
-		os.Exit(1)
-	}
-	if err := config.ApplyEnv(c); err != nil {
-		logger.Error("failed to apply environment overrides", "error", err)
 		os.Exit(1)
 	}
 	if *checkConfig {
@@ -104,17 +96,28 @@ func main() {
 	}
 }
 
-func parseLogLevel(s string) slog.Level {
-	switch strings.ToLower(s) {
+func newLogger(format, level string) (*slog.Logger, error) {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
 	case "debug":
-		return slog.LevelDebug
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
 	case "warn":
-		return slog.LevelWarn
+		lvl = slog.LevelWarn
 	case "error":
-		return slog.LevelError
+		lvl = slog.LevelError
 	default:
-		return slog.LevelInfo
+		return nil, fmt.Errorf("invalid --log-level %q: want debug, info, warn, or error", level)
 	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch strings.ToLower(format) {
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	}
+	return nil, fmt.Errorf("invalid --log-format %q: want json or text", format)
 }
 
 func validateListenAddress(address string) error {

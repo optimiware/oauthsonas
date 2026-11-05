@@ -49,7 +49,7 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 		t.Fatal(err)
 	}
 	c := testConfig("http://" + listener.Addr().String())
-	c.AuthorizationCodeTTL = codeTTL.String()
+	c.AuthorizationCodeTTL = config.Duration(codeTTL)
 	if mutate != nil {
 		mutate(c)
 	}
@@ -68,7 +68,7 @@ func newTestProviderConfig(t *testing.T, codeTTL time.Duration, mutate func(*con
 
 func testConfig(issuer string) *config.Config {
 	return &config.Config{
-		Issuer: issuer, APIAudience: "https://api.example.test", TokenTTL: "15m", AuthorizationCodeTTL: "5m", RefreshTokenTTL: "8h",
+		Issuer: issuer, APIAudience: "https://api.example.test", TokenTTL: config.Duration(15 * time.Minute), AuthorizationCodeTTL: config.Duration(5 * time.Minute), RefreshTokenTTL: config.Duration(8 * time.Hour),
 		Clients: []config.Client{{ID: "dashboard", Name: "Dashboard", Public: true, RedirectURIs: []string{"http://127.0.0.1:5173/auth/callback"}, PostLogoutRedirectURIs: []string{"http://127.0.0.1:5173/"}, AllowedOrigins: []string{"http://127.0.0.1:5173"}}},
 		Personas: []config.Persona{
 			{ID: "acme-admin", Subject: "oauthsonas|acme-admin", Email: "admin@acme.dev.optimi.test", Name: "Acme Administrator", OrganizationID: "org_acme", Roles: []string{"customer-admin"}},

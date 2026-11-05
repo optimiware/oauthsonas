@@ -1,6 +1,9 @@
+// Package config loads and validates the oauthsonas YAML configuration.
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -8,24 +11,48 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
+)
+
+const (
+	defaultTokenTTL             = 15 * time.Minute
+	defaultAuthorizationCodeTTL = 5 * time.Minute
+	defaultRefreshTokenTTL      = 8 * time.Hour
+	minAccessCodeLength         = 16
 )
 
 // Config is the complete development OIDC server configuration.
 type Config struct {
-	Issuer                  string        `yaml:"issuer"`
-	APIAudience             string        `yaml:"api_audience"`
-	AccessCode              string        `yaml:"access_code"`
-	TokenTTL                string        `yaml:"token_ttl"`
-	AuthorizationCodeTTL    string        `yaml:"authorization_code_ttl"`
-	RefreshTokenTTL         string        `yaml:"refresh_token_ttl"`
-	AllowedRoles            []string      `yaml:"allowed_roles"`
-	Claims                  Claims        `yaml:"claims"`
-	Clients                 []Client      `yaml:"clients"`
-	Personas                []Persona     `yaml:"personas"`
-	TokenTTLDuration        time.Duration `yaml:"-"`
-	AuthorizationCodeTTLD   time.Duration `yaml:"-"`
-	RefreshTokenTTLDuration time.Duration `yaml:"-"`
+	Issuer               string    `yaml:"issuer"`
+	APIAudience          string    `yaml:"api_audience"`
+	AccessCode           string    `yaml:"access_code"`
+	TokenTTL             Duration  `yaml:"token_ttl"`
+	AuthorizationCodeTTL Duration  `yaml:"authorization_code_ttl"`
+	RefreshTokenTTL      Duration  `yaml:"refresh_token_ttl"`
+	AllowedRoles         []string  `yaml:"allowed_roles"`
+	Claims               Claims    `yaml:"claims"`
+	Clients              []Client  `yaml:"clients"`
+	Personas             []Persona `yaml:"personas"`
+}
+
+// Duration is a positive time span written as a Go duration string such as
+// "15m". Bare numbers are rejected rather than read as nanoseconds.
+type Duration time.Duration
+
+// D returns the duration as a time.Duration.
+func (d Duration) D() time.Duration { return time.Duration(d) }
+
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("line %d: %q is not a positive Go duration such as 15m", node.Line, raw)
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Claims configures JWT/userinfo claim names for application attributes.
@@ -54,12 +81,16 @@ type Persona struct {
 	Memberships    []string `yaml:"memberships"`
 }
 
+// Load reads, decodes, and validates the configuration at path. The
+// OAUTHSONAS_ACCESS_CODE environment variable replaces access_code when set,
+// even with an empty value, and is validated like the file value, so a bad
+// environment fails startup and --check-config instead of weakening the gate.
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	decoder := yaml.NewDecoder(strings.NewReader(string(b)))
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
 	decoder.KnownFields(true)
 	var c Config
 	if err := decoder.Decode(&c); err != nil {
@@ -72,152 +103,157 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+	if code, ok := os.LookupEnv("OAUTHSONAS_ACCESS_CODE"); ok {
+		c.AccessCode = code
+	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-// ApplyEnv applies environment overrides that cannot live in the config file.
-// OAUTHSONAS_ACCESS_CODE replaces access_code when set (even with an empty
-// value) and is validated the same way, so a bad environment fails startup and
-// --check-config instead of starting with a weaker gate.
-func ApplyEnv(c *Config) error {
-	if raw, ok := os.LookupEnv("OAUTHSONAS_ACCESS_CODE"); ok {
-		c.AccessCode = raw
-		return c.Validate()
-	}
-	return nil
+// Validate fills in defaults and then checks the whole configuration. It
+// reports every problem it finds, not just the first.
+func (c *Config) Validate() error {
+	c.applyDefaults()
+	var errs []error
+	errs = append(errs, c.validateServer()...)
+	errs = append(errs, c.Claims.validate()...)
+	errs = append(errs, c.validateClients()...)
+	errs = append(errs, c.validatePersonas()...)
+	return errors.Join(errs...)
 }
 
-func (c *Config) Validate() error {
-	if err := validateAbsoluteURL(c.Issuer, "issuer"); err != nil {
-		return err
+func (c *Config) applyDefaults() {
+	c.AccessCode = strings.TrimSpace(c.AccessCode)
+	if c.TokenTTL == 0 {
+		c.TokenTTL = Duration(defaultTokenTTL)
 	}
-	issuer, _ := url.Parse(c.Issuer)
-	if issuer.Path != "" {
-		return fmt.Errorf("issuer must not include a path")
+	if c.AuthorizationCodeTTL == 0 {
+		c.AuthorizationCodeTTL = Duration(defaultAuthorizationCodeTTL)
 	}
-	if strings.HasSuffix(c.Issuer, "/") {
-		return fmt.Errorf("issuer must not end with '/'")
+	if c.RefreshTokenTTL == 0 {
+		c.RefreshTokenTTL = Duration(defaultRefreshTokenTTL)
+	}
+	if c.Claims.Roles == "" {
+		c.Claims.Roles = "roles"
+	}
+	if c.Claims.Memberships == "" {
+		c.Claims.Memberships = "memberships"
+	}
+	if c.Claims.OrgID == "" {
+		c.Claims.OrgID = "org_id"
+	}
+}
+
+func (c *Config) validateServer() []error {
+	var errs []error
+	if u, ok := httpURL(c.Issuer); !ok || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		errs = append(errs, fmt.Errorf("issuer must be an absolute http(s) URL without query or fragment"))
+	} else if u.Path != "" {
+		errs = append(errs, fmt.Errorf("issuer must not include a path"))
 	}
 	if strings.TrimSpace(c.APIAudience) == "" {
-		return fmt.Errorf("api_audience is required")
+		errs = append(errs, fmt.Errorf("api_audience is required"))
+	} else if u, ok := httpURL(c.APIAudience); !ok || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		errs = append(errs, fmt.Errorf("api_audience must be an absolute http(s) URL without query or fragment"))
 	}
-	if err := validateAbsoluteURL(c.APIAudience, "api_audience"); err != nil {
-		return err
+	if strings.ContainsAny(c.AccessCode, " \t\r\n") {
+		errs = append(errs, fmt.Errorf("access_code must not contain whitespace"))
+	} else if c.AccessCode != "" && len(c.AccessCode) < minAccessCodeLength {
+		errs = append(errs, fmt.Errorf("access_code must be at least %d characters", minAccessCodeLength))
 	}
-	c.AccessCode = strings.TrimSpace(c.AccessCode)
-	if c.AccessCode != "" {
-		if strings.ContainsAny(c.AccessCode, " \t\r\n") {
-			return fmt.Errorf("access_code must not contain whitespace")
+	for field, d := range map[string]Duration{"token_ttl": c.TokenTTL, "authorization_code_ttl": c.AuthorizationCodeTTL, "refresh_token_ttl": c.RefreshTokenTTL} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be a positive duration", field))
 		}
-		if len(c.AccessCode) < 16 {
-			return fmt.Errorf("access_code must be at least 16 characters")
-		}
 	}
-	var err error
-	if c.TokenTTLDuration, err = parseDuration(c.TokenTTL, "token_ttl", 15*time.Minute); err != nil {
-		return err
-	}
-	if c.AuthorizationCodeTTLD, err = parseDuration(c.AuthorizationCodeTTL, "authorization_code_ttl", 5*time.Minute); err != nil {
-		return err
-	}
-	if c.RefreshTokenTTLDuration, err = parseDuration(c.RefreshTokenTTL, "refresh_token_ttl", 8*time.Hour); err != nil {
-		return err
-	}
-	if err := c.Claims.applyDefaults(); err != nil {
-		return err
-	}
+	return errs
+}
+
+func (c *Config) validateClients() []error {
 	if len(c.Clients) == 0 {
-		return fmt.Errorf("at least one client is required")
+		return []error{fmt.Errorf("at least one client is required")}
 	}
-	if len(c.Personas) == 0 {
-		return fmt.Errorf("at least one persona is required")
-	}
-	clientIDs := map[string]bool{}
-	for i := range c.Clients {
-		client := &c.Clients[i]
+	var errs []error
+	seen := map[string]bool{}
+	for i, client := range c.Clients {
 		if client.ID == "" || client.Name == "" {
-			return fmt.Errorf("client %d requires id and name", i)
+			errs = append(errs, fmt.Errorf("client %d requires id and name", i))
 		}
-		if clientIDs[client.ID] {
-			return fmt.Errorf("duplicate client id %q", client.ID)
+		if seen[client.ID] {
+			errs = append(errs, fmt.Errorf("duplicate client id %q", client.ID))
 		}
-		clientIDs[client.ID] = true
+		seen[client.ID] = true
 		if !client.Public {
-			return fmt.Errorf("client %q must set public: true; confidential clients are unsupported", client.ID)
+			errs = append(errs, fmt.Errorf("client %q must set public: true; confidential clients are unsupported", client.ID))
 		}
 		if len(client.RedirectURIs) == 0 {
-			return fmt.Errorf("client %q requires at least one redirect_uri", client.ID)
+			errs = append(errs, fmt.Errorf("client %q requires at least one redirect_uri", client.ID))
 		}
 		for _, raw := range client.RedirectURIs {
-			if err := validateRedirectURL(raw, "redirect_uri", client.ID); err != nil {
-				return err
+			if u, ok := httpURL(raw); !ok || u.Fragment != "" {
+				errs = append(errs, fmt.Errorf("client %q: redirect_uri must be an absolute http(s) URL without fragment", client.ID))
 			}
 		}
 		for _, raw := range client.PostLogoutRedirectURIs {
-			if err := validateRedirectURL(raw, "post_logout_redirect_uri", client.ID); err != nil {
-				return err
+			if u, ok := httpURL(raw); !ok || u.Fragment != "" {
+				errs = append(errs, fmt.Errorf("client %q: post_logout_redirect_uri must be an absolute http(s) URL without fragment", client.ID))
 			}
 		}
 		for _, raw := range client.AllowedOrigins {
-			if err := validateOrigin(raw, client.ID); err != nil {
-				return err
+			if u, ok := httpURL(raw); !ok || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+				errs = append(errs, fmt.Errorf("client %q: allowed_origin %q must be a scheme and host only", client.ID, raw))
 			}
 		}
 	}
+	return errs
+}
+
+func (c *Config) validatePersonas() []error {
+	var errs []error
 	allowedRoles := map[string]bool{}
 	for _, role := range c.AllowedRoles {
 		if role == "" {
-			return fmt.Errorf("allowed_roles must not contain an empty role")
+			errs = append(errs, fmt.Errorf("allowed_roles must not contain an empty role"))
 		}
 		if allowedRoles[role] {
-			return fmt.Errorf("duplicate allowed role %q", role)
+			errs = append(errs, fmt.Errorf("duplicate allowed role %q", role))
 		}
 		allowedRoles[role] = true
 	}
-	personaIDs, subjects := map[string]bool{}, map[string]bool{}
-	for i := range c.Personas {
-		p := &c.Personas[i]
+	if len(c.Personas) == 0 {
+		return append(errs, fmt.Errorf("at least one persona is required"))
+	}
+	ids, subjects := map[string]bool{}, map[string]bool{}
+	for i, p := range c.Personas {
 		if p.ID == "" || p.Subject == "" || p.Email == "" || p.Name == "" {
-			return fmt.Errorf("persona %d requires id, subject, email, and name", i)
+			errs = append(errs, fmt.Errorf("persona %d requires id, subject, email, and name", i))
 		}
-		if personaIDs[p.ID] {
-			return fmt.Errorf("duplicate persona id %q", p.ID)
+		if ids[p.ID] {
+			errs = append(errs, fmt.Errorf("duplicate persona id %q", p.ID))
 		}
 		if subjects[p.Subject] {
-			return fmt.Errorf("duplicate persona subject %q", p.Subject)
+			errs = append(errs, fmt.Errorf("duplicate persona subject %q", p.Subject))
 		}
-		personaIDs[p.ID], subjects[p.Subject] = true, true
+		ids[p.ID], subjects[p.Subject] = true, true
 		if len(p.Roles) == 0 {
-			return fmt.Errorf("persona %q requires at least one role", p.ID)
+			errs = append(errs, fmt.Errorf("persona %q requires at least one role", p.ID))
 		}
 		for _, role := range p.Roles {
 			if role == "" {
-				return fmt.Errorf("persona %q has an empty role", p.ID)
-			}
-			if len(allowedRoles) != 0 && !allowedRoles[role] {
-				return fmt.Errorf("persona %q has unsupported role %q", p.ID, role)
+				errs = append(errs, fmt.Errorf("persona %q has an empty role", p.ID))
+			} else if len(allowedRoles) != 0 && !allowedRoles[role] {
+				errs = append(errs, fmt.Errorf("persona %q has unsupported role %q", p.ID, role))
 			}
 		}
 	}
-	return nil
+	return errs
 }
 
-func (c *Claims) applyDefaults() error {
-	if c.Roles == "" {
-		c.Roles = "roles"
-	}
-	if c.Memberships == "" {
-		c.Memberships = "memberships"
-	}
-	if c.OrgID == "" {
-		c.OrgID = "org_id"
-	}
-	names := []struct {
-		field, value string
-	}{
+func (c *Claims) validate() []error {
+	var errs []error
+	names := []struct{ field, value string }{
 		{"claims.roles", c.Roles},
 		{"claims.memberships", c.Memberships},
 		{"claims.org_id", c.OrgID},
@@ -225,84 +261,36 @@ func (c *Claims) applyDefaults() error {
 	seen := map[string]string{}
 	for _, name := range names {
 		if strings.TrimSpace(name.value) != name.value || name.value == "" {
-			return fmt.Errorf("%s must be a non-empty claim name", name.field)
-		}
-		if strings.ContainsAny(name.value, " \t\r\n") {
-			return fmt.Errorf("%s must not contain whitespace", name.field)
+			errs = append(errs, fmt.Errorf("%s must be a non-empty claim name", name.field))
+		} else if strings.ContainsAny(name.value, " \t\r\n") {
+			errs = append(errs, fmt.Errorf("%s must not contain whitespace", name.field))
 		}
 		if other, ok := seen[name.value]; ok {
-			return fmt.Errorf("%s and %s must use distinct claim names", other, name.field)
+			errs = append(errs, fmt.Errorf("%s and %s must use distinct claim names", other, name.field))
 		}
 		seen[name.value] = name.field
-	}
-	for _, name := range names {
-		if isReservedClaim(name.value) {
-			return fmt.Errorf("%s %q collides with a standard JWT/OIDC claim name", name.field, name.value)
+		if reservedClaims[name.value] {
+			errs = append(errs, fmt.Errorf("%s %q collides with a standard JWT/OIDC claim name", name.field, name.value))
 		}
 	}
-	return nil
+	return errs
 }
 
+// reservedClaims are names the server or the OIDC/JWT specs already use.
 var reservedClaims = map[string]bool{
-	"sub":            true,
-	"iss":            true,
-	"aud":            true,
-	"exp":            true,
-	"iat":            true,
-	"nbf":            true,
-	"jti":            true,
-	"auth_time":      true,
-	"nonce":          true,
-	"acr":            true,
-	"amr":            true,
-	"azp":            true,
-	"at_hash":        true,
-	"c_hash":         true,
-	"email":          true,
-	"email_verified": true,
-	"name":           true,
-	"client_id":      true,
-	"scope":          true,
-	"kid":            true,
-	"alg":            true,
-	"typ":            true,
+	"sub": true, "iss": true, "aud": true, "exp": true, "iat": true, "nbf": true, "jti": true,
+	"auth_time": true, "nonce": true, "acr": true, "amr": true, "azp": true,
+	"at_hash": true, "c_hash": true,
+	"email": true, "email_verified": true, "name": true,
+	"client_id": true, "scope": true,
+	"kid": true, "alg": true, "typ": true,
 }
 
-func isReservedClaim(name string) bool {
-	return reservedClaims[name]
-}
-
-func parseDuration(raw, field string, fallback time.Duration) (time.Duration, error) {
-	if raw == "" {
-		return fallback, nil
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return 0, fmt.Errorf("%s must be a positive Go duration", field)
-	}
-	return d, nil
-}
-
-func validateAbsoluteURL(raw, field string) error {
+// httpURL parses raw as an absolute http(s) URL with a host and no userinfo.
+func httpURL(raw string) (*url.URL, bool) {
 	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return fmt.Errorf("%s must be an absolute http(s) URL without query or fragment", field)
+	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, false
 	}
-	return nil
-}
-
-func validateRedirectURL(raw, field, client string) error {
-	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Fragment != "" {
-		return fmt.Errorf("client %q: %s must be an absolute http(s) URL without fragment", client, field)
-	}
-	return nil
-}
-
-func validateOrigin(raw, client string) error {
-	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("client %q: allowed_origin %q must be a scheme and host only", client, raw)
-	}
-	return nil
+	return u, true
 }

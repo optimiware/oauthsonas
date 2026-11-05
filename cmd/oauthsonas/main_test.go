@@ -20,3 +20,21 @@ func TestValidateListenAddressAllowsExplicitOverride(t *testing.T) {
 		t.Fatalf("explicit override was rejected: %v", err)
 	}
 }
+
+func TestNewLogger(t *testing.T) {
+	for _, tc := range []struct {
+		format, level string
+		ok            bool
+	}{
+		{"json", "info", true},
+		{"text", "DEBUG", true},
+		{"json", "warn", true},
+		{"yaml", "info", false},
+		{"json", "verbose", false},
+	} {
+		_, err := newLogger(tc.format, tc.level)
+		if (err == nil) != tc.ok {
+			t.Errorf("newLogger(%q, %q) error = %v, want ok=%v", tc.format, tc.level, err, tc.ok)
+		}
+	}
+}
