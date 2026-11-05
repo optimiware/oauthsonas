@@ -69,6 +69,7 @@ func main() {
 		logger.Error("failed to create server", "error", err)
 		os.Exit(1)
 	}
+	defer s.Close()
 	logger.Info("starting developer OIDC provider", "issuer", c.Issuer, "listen", *listen)
 	httpServer := &http.Server{
 		Addr:              *listen,

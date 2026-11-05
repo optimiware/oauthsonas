@@ -45,12 +45,13 @@ type Server struct {
 	interactions interactionStore
 	gate         gateStore
 	accessCode   string
-	tokenMu      sync.Mutex
+	storeMu      sync.Mutex
 	template     *template.Template
 	logger       *slog.Logger
 	version      string
 	startTime    time.Time
 	cleanupDone  chan struct{}
+	closeOnce    sync.Once
 }
 
 type oidcClient struct {
@@ -719,7 +720,9 @@ func (s *Server) completeAuthorization(w http.ResponseWriter, r *http.Request, a
 	}
 	ar.GrantAudience(s.config.APIAudience)
 	session := s.personaSession(persona, ar)
+	s.storeMu.Lock()
 	resp, err := s.provider.NewAuthorizeResponse(r.Context(), ar, session)
+	s.storeMu.Unlock()
 	if err != nil {
 		s.provider.WriteAuthorizeError(r.Context(), w, ar, err)
 		return
@@ -790,8 +793,8 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	requestedScope, scopeProvided := r.Form["scope"]
 
-	s.tokenMu.Lock()
-	defer s.tokenMu.Unlock()
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	accessRequest, err := s.provider.NewAccessRequest(r.Context(), r, newSession())
 	if err != nil {
 		grantType := r.Form.Get("grant_type")
@@ -859,7 +862,9 @@ func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid bearer token transport", http.StatusBadRequest)
 		return
 	}
+	s.storeMu.Lock()
 	_, accessRequest, err := s.provider.IntrospectToken(r.Context(), token, fosite.AccessToken, newSession())
+	s.storeMu.Unlock()
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
@@ -959,7 +964,7 @@ func (s *Server) clientIDFromIDTokenHint(hint string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("id_token_hint parse: %w", err)
 	}
-	payload, err := jws.Verify(s.key.Key)
+	payload, err := jws.Verify(s.key.Public())
 	if err != nil {
 		return "", fmt.Errorf("id_token_hint verify: %w", err)
 	}
@@ -986,6 +991,11 @@ func (s *Server) clientIDFromIDTokenHint(hint string) (string, error) {
 	return "", fmt.Errorf("id_token_hint: no client identifier found")
 }
 
+// Close stops background cleanup. It is safe to call more than once.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() { close(s.cleanupDone) })
+}
+
 func (s *Server) startCleanup() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -1002,34 +1012,57 @@ func (s *Server) startCleanup() {
 }
 
 func (s *Server) cleanupStore() {
-	s.tokenMu.Lock()
-	defer s.tokenMu.Unlock()
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	now := time.Now()
+	codeTTL, accessTTL, refreshTTL := s.config.AuthorizationCodeTTLD, s.config.TokenTTLDuration, s.config.RefreshTokenTTLDuration
 	for id, req := range s.store.AuthorizeCodes {
-		if req.GetRequestedAt().Add(s.config.AuthorizationCodeTTLD).Before(now) {
+		if expired(req, fosite.AuthorizeCode, codeTTL, now) {
 			delete(s.store.AuthorizeCodes, id)
 		}
 	}
-	for id, req := range s.store.AccessTokens {
-		if req.GetRequestedAt().Add(s.config.TokenTTLDuration).Before(now) {
-			delete(s.store.AccessTokens, id)
-		}
-	}
-	for id, req := range s.store.RefreshTokens {
-		if req.GetRequestedAt().Add(s.config.RefreshTokenTTLDuration).Before(now) {
-			delete(s.store.RefreshTokens, id)
-		}
-	}
 	for id, req := range s.store.PKCES {
-		if req.GetRequestedAt().Add(s.config.AuthorizationCodeTTLD).Before(now) {
+		if expired(req, fosite.AuthorizeCode, codeTTL, now) {
 			delete(s.store.PKCES, id)
 		}
 	}
 	for id, req := range s.store.IDSessions {
-		if req.GetRequestedAt().Add(s.config.TokenTTLDuration).Before(now) {
+		if expired(req, fosite.AuthorizeCode, codeTTL, now) {
 			delete(s.store.IDSessions, id)
 		}
 	}
+	for id, req := range s.store.AccessTokens {
+		if expired(req, fosite.AccessToken, accessTTL, now) {
+			delete(s.store.AccessTokens, id)
+		}
+	}
+	for id, req := range s.store.RefreshTokens {
+		if expired(req, fosite.RefreshToken, refreshTTL, now) {
+			delete(s.store.RefreshTokens, id)
+		}
+	}
+	for requestID, signature := range s.store.AccessTokenRequestIDs {
+		if _, ok := s.store.AccessTokens[signature]; !ok {
+			delete(s.store.AccessTokenRequestIDs, requestID)
+		}
+	}
+	for requestID, signature := range s.store.RefreshTokenRequestIDs {
+		if _, ok := s.store.RefreshTokens[signature]; !ok {
+			delete(s.store.RefreshTokenRequestIDs, requestID)
+		}
+	}
+}
+
+// expired reports whether a stored request is past its token's expiry. It
+// prefers the session's own expiry, which fosite refreshes on rotation, and
+// falls back to the request time plus ttl.
+func expired(req fosite.Requester, kind fosite.TokenType, ttl time.Duration, now time.Time) bool {
+	if sess := req.GetSession(); sess != nil {
+		if at := sess.GetExpiresAt(kind); !at.IsZero() {
+			return at.Before(now)
+		}
+	}
+	return req.GetRequestedAt().Add(ttl).Before(now)
 }
 
 func (s *Server) validPostLogoutURI(clientID, target string) bool {
