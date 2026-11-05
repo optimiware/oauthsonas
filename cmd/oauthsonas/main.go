@@ -53,7 +53,7 @@ func main() {
 	}
 	c, err := config.Load(*configPath)
 	if err != nil {
-		logger.Error("failed to load config", "error", err)
+		logErrors(logger, "invalid config", err)
 		os.Exit(1)
 	}
 	if *checkConfig {
@@ -102,6 +102,17 @@ func main() {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 	}
+}
+
+// logErrors logs each error of an errors.Join result as its own entry.
+func logErrors(logger *slog.Logger, msg string, err error) {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range joined.Unwrap() {
+			logger.Error(msg, "error", e)
+		}
+		return
+	}
+	logger.Error(msg, "error", err)
 }
 
 func newLogger(format, level string) (*slog.Logger, error) {
