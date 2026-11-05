@@ -171,6 +171,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /.well-known/jwks.json", s.jwks)
 	mux.HandleFunc("OPTIONS /.well-known/jwks.json", s.preflight(http.MethodGet))
 	mux.HandleFunc("GET /oauth2/auth", s.authorize)
+	// A GET pattern also matches HEAD, and authorize with login_hint issues a
+	// code, so crawlers and link previewers must not be able to trigger it.
+	mux.HandleFunc("HEAD /oauth2/auth", func(w http.ResponseWriter, r *http.Request) { methodNotAllowed(w, http.MethodGet) })
 	mux.HandleFunc("POST /oauth2/auth/select", s.selectPersona)
 	mux.HandleFunc("POST /oauth2/gate", s.gateSubmit)
 	mux.HandleFunc("POST /oauth2/token", s.token)

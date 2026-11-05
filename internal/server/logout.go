@@ -28,10 +28,12 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		case clientID == "":
 			clientID = hintClientID
 		case hintClientID != clientID:
-			s.logger.LogAttrs(r.Context(), slog.LevelWarn, "logout",
-				slog.String("status", "warning"),
+			// OIDC RP-Initiated Logout: client_id must match the hint's audience.
+			s.logFail(r, "logout", "validation", "client_id does not match id_token_hint",
 				slog.String("client_id_param", clientID),
 				slog.String("client_id_hint", hintClientID))
+			http.Error(w, "client_id does not match id_token_hint", http.StatusBadRequest)
+			return
 		}
 	}
 	if target == "" {

@@ -179,3 +179,49 @@ func TestTokenEndpointIgnoresQueryParameters(t *testing.T) {
 		t.Fatal("token endpoint accepted a code_verifier from the query string")
 	}
 }
+
+func TestHeadAuthorizeNeverIssuesCode(t *testing.T) {
+	t.Parallel()
+	p := newTestProvider(t, 5*time.Minute)
+	params := validAuthorizeParams()
+	params.Set("login_hint", "acme-admin")
+	request, _ := http.NewRequest(http.MethodHead, authorizeURL(p.baseURL, params), nil)
+	response, err := browserClient(t).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Location") != "" {
+		t.Fatalf("HEAD authorize: status=%d location=%q, want 405 and no redirect", response.StatusCode, response.Header.Get("Location"))
+	}
+}
+
+func TestLogoutRejectsClientIDThatContradictsIDTokenHint(t *testing.T) {
+	t.Parallel()
+	p := twoClientProvider(t)
+	_, result := fullFlow(t, p, "acme-admin") // token issued to "dashboard"
+	idToken := result["id_token"].(string)
+	client := browserClient(t)
+
+	// "other" is a real client with this registered logout URI, so only the
+	// mismatch with the hint can make this request fail.
+	response, err := client.Get(p.baseURL + "/logout?client_id=other&id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("http://127.0.0.1:6000/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("contradicting client_id: status = %d, want 400", response.StatusCode)
+	}
+
+	response, err = client.Get(p.baseURL + "/logout?client_id=dashboard&id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("http://127.0.0.1:5173/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("matching client_id: status = %d, want 302", response.StatusCode)
+	}
+}

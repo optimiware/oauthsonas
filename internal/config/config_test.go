@@ -293,3 +293,17 @@ func TestValidateOrigins(t *testing.T) {
 		t.Fatalf("valid origin rejected: %v", err)
 	}
 }
+
+func TestLoadEmptyDurationUsesDefault(t *testing.T) {
+	t.Setenv("OAUTHSONAS_ACCESS_CODE", "")
+	for _, extra := range []string{`token_ttl: ""`, "token_ttl:", "token_ttl: null"} {
+		c, err := Load(writeConfig(t, extra))
+		if err != nil {
+			t.Errorf("%q: %v", extra, err)
+			continue
+		}
+		if c.TokenTTL.D() != 15*time.Minute {
+			t.Errorf("%q: token_ttl = %v, want the 15m default", extra, c.TokenTTL.D())
+		}
+	}
+}

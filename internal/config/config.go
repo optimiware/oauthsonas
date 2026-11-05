@@ -36,7 +36,8 @@ type Config struct {
 }
 
 // Duration is a positive time span written as a Go duration string such as
-// "15m". Bare numbers are rejected rather than read as nanoseconds.
+// "15m". An empty value keeps the default; bare numbers are rejected rather
+// than read as nanoseconds.
 type Duration time.Duration
 
 // D returns the duration as a time.Duration.
@@ -46,6 +47,9 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	var raw string
 	if err := node.Decode(&raw); err != nil {
 		return err
+	}
+	if raw == "" {
+		return nil // unset or empty: keep the default
 	}
 	parsed, err := time.ParseDuration(raw)
 	if err != nil || parsed <= 0 {
