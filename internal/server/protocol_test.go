@@ -24,6 +24,7 @@ func redirectError(t *testing.T, response *http.Response) (code, state string) {
 }
 
 func TestPromptNoneReturnsLoginRequiredWithoutPicker(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	for name, hint := range map[string]string{"no hint": "", "with login_hint": "acme-admin"} {
@@ -47,6 +48,7 @@ func TestPromptNoneReturnsLoginRequiredWithoutPicker(t *testing.T) {
 }
 
 func TestPromptValidation(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	for name, tc := range map[string]struct{ prompt, wantError string }{
@@ -77,6 +79,7 @@ func TestPromptValidation(t *testing.T) {
 }
 
 func TestLogoutAcceptsPost(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	response, err := client.PostForm(p.baseURL+"/logout", url.Values{
@@ -94,6 +97,7 @@ func TestLogoutAcceptsPost(t *testing.T) {
 }
 
 func TestUserinfoErrorsCarryCORSForRegisteredOrigins(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	for name, tc := range map[string]struct {
 		origin    string
@@ -125,6 +129,7 @@ func TestUserinfoErrorsCarryCORSForRegisteredOrigins(t *testing.T) {
 }
 
 func TestTokenEndpointCORS(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	post := func(origin, clientID string) *http.Response {
 		t.Helper()
@@ -157,6 +162,7 @@ func TestTokenEndpointCORS(t *testing.T) {
 }
 
 func TestTokenEndpointIgnoresQueryParameters(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	client := browserClient(t)
 	code := selectPersona(t, p, client, begin(t, p, client, validAuthorizeParams()), "acme-admin")

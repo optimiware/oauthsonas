@@ -22,6 +22,7 @@ func twoClientProvider(t *testing.T) *testProvider {
 }
 
 func TestIDTokenHintIdentifiesClient(t *testing.T) {
+	t.Parallel()
 	p := twoClientProvider(t)
 	_, result := fullFlow(t, p, "acme-admin")
 	idToken := result["id_token"].(string)
@@ -55,6 +56,7 @@ func TestIDTokenHintIdentifiesClient(t *testing.T) {
 }
 
 func TestIDTokenHintRejectsForgedToken(t *testing.T) {
+	t.Parallel()
 	p := twoClientProvider(t)
 	other := twoClientProvider(t)
 	_, result := fullFlow(t, other, "acme-admin")
@@ -66,6 +68,7 @@ func TestIDTokenHintRejectsForgedToken(t *testing.T) {
 
 // Run with -race: cleanup must not touch fosite's maps while requests do.
 func TestCleanupIsSafeDuringTraffic(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	stop := make(chan struct{})
 	var cleaners sync.WaitGroup
@@ -114,6 +117,7 @@ func TestCleanupIsSafeDuringTraffic(t *testing.T) {
 }
 
 func TestCloseStopsCleanupAndIsIdempotent(t *testing.T) {
+	t.Parallel()
 	p := newTestProvider(t, 5*time.Minute)
 	p.srv.Close()
 	p.srv.Close()

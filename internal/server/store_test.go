@@ -13,6 +13,7 @@ func fakeClockStore(ttl time.Duration) (*ttlStore[string], *time.Time) {
 }
 
 func TestTTLStoreExpiresEntries(t *testing.T) {
+	t.Parallel()
 	s, now := fakeClockStore(time.Minute)
 	id, err := s.put("value")
 	if err != nil {
@@ -28,6 +29,7 @@ func TestTTLStoreExpiresEntries(t *testing.T) {
 }
 
 func TestTTLStoreTakeIsOneShotAndRejectionKeepsEntry(t *testing.T) {
+	t.Parallel()
 	s, _ := fakeClockStore(time.Minute)
 	id, _ := s.put("secret")
 
@@ -46,6 +48,7 @@ func TestTTLStoreTakeIsOneShotAndRejectionKeepsEntry(t *testing.T) {
 }
 
 func TestTTLStoreSweepRemovesOnlyExpired(t *testing.T) {
+	t.Parallel()
 	s, now := fakeClockStore(time.Minute)
 	old, _ := s.put("old")
 	*now = now.Add(45 * time.Second)
